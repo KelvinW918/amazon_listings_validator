@@ -1,0 +1,167 @@
+import re
+import unicodedata
+from typing import List, Tuple
+from app.core.config import settings
+from app.models.listing import ListingValidationInput, N8nListingOutput
+
+# Regex con soporte para emojis Unicode y modificadores de variación
+BULLET_FORMAT_REGEX = re.compile(
+    r'^(?:[\U00010000-\U0010ffff]|[\u2100-\u2bff]|[\u2600-\u26ff]|[\u2700-\u27bf])[\ufe0f\u200d]*\s*([A-Z0-9\sÁÉÍÓÚÑÜ\-\–\—\(\)\/]+):'
+)
+
+def validate_listing_status(status_input: bool | str | None) -> Tuple[str, str]:
+    """Regla 1: Activo / Inactivo / N/A según disponibilidad real."""
+    if status_input is None:
+        return "N/A", "Estado del listing no verificable (sin datos)."
+
+    if isinstance(status_input, str):
+        active = status_input.strip().lower() in {"activo", "active", "true", "buyable", "yes", "si", "sí", "ok"}
+    else:
+        active = bool(status_input)
+
+    return ("Activo", "Listing activo.") if active else ("Inactivo", "Listing inactivo o no comprable.")
+
+def validate_title(title: str | None, max_override: int | None = None) -> Tuple[str, str]:
+    """Regla 2: Título en rango 50-80 chars (o override) con normalización Unicode."""
+    clean = unicodedata.normalize("NFC", title or "").strip()
+    min_len = settings.DEFAULT_MIN_TITLE_LEN
+    max_len = max_override if max_override is not None else settings.DEFAULT_MAX_TITLE_LEN
+    length = len(clean)
+
+    if length == 0:
+        return "NOK", "Título vacío o no recuperado."
+    if min_len <= length <= max_len:
+        return "OK", f"Longitud correcta ({length} caracteres)."
+    return "NOK", f"Longitud fuera de rango ({length} chars. Permitido: {min_len}-{max_len})."
+
+def validate_bullet_points(bullets: List[str]) -> Tuple[str, str]:
+    """Regla 3: Exactamente 5 bullets, <= 250 chars y formato Emoji + MAYÚSCULAS + :"""
+    if len(bullets) != settings.REQUIRED_BULLETS_COUNT:
+        return "NOK", f"Cantidad incorrecta de bullets ({len(bullets)} de 5 requeridos)."
+
+    errors = []
+    for idx, bullet in enumerate(bullets, 1):
+        bullet_clean = bullet.strip()
+        if len(bullet_clean) > settings.MAX_BULLET_CHARS:
+            errors.append(f"B{idx} excede 250 chars ({len(bullet_clean)})")
+        if not BULLET_FORMAT_REGEX.match(bullet_clean):
+            errors.append(f"B{idx} sin formato 'Emoji + MAYÚSCULAS + :'")
+
+    if errors:
+        return "NOK", f"Fallos en bullets: {', '.join(errors)}"
+    return "OK", "5 bullets cumplen formato y longitud SOP."
+
+def validate_variations(variations: List[str]) -> Tuple[str, str]:
+    """Regla 4: Presencia de 2+ opciones agrupadas o N/A para productos simples."""
+    count = len(variations)
+    if count >= settings.MIN_VARIATIONS_COUNT:
+        return "OK", f"Tiene {count} variaciones vinculadas."
+    elif count <= 1:
+        return "N/A", "Producto individual sin variaciones."
+    return "NOK", f"Variaciones insuficientes ({count}). Se requieren al menos {settings.MIN_VARIATIONS_COUNT}."
+
+def validate_images(images: List[str]) -> Tuple[str, str]:
+    """Regla 5: Carrusel principal con 7 a 10 imágenes."""
+    count = len(images)
+    if settings.MIN_IMAGES_COUNT <= count <= settings.MAX_IMAGES_COUNT:
+        return "OK", f"Carrusel óptimo ({count} imágenes)."
+    return "NOK", f"Imágenes fuera de rango ({count} de 7-10)."
+
+def validate_video(has_video: bool | None) -> Tuple[str, str]:
+    """Regla 6: Presencia de al menos 1 video publicado."""
+    if has_video is None:
+        return "N/A", "Sin datos de video en SP-API."
+    if has_video:
+        return "OK", "Video publicado detectado."
+    return "NOK", "Listing sin video publicado."
+
+def validate_a_plus_comparative(
+    has_a_plus: bool | None,
+    comp_count: int | None,
+    has_price: bool | None,
+    has_reviews: bool | None
+) -> Tuple[str, str]:
+    """Regla 7: Cuadro comparativo A+ con 4-6 productos hermanos + PVP + reseñas."""
+    if has_a_plus is None:
+        return "N/A", "Sin datos de A+ en SP-API."
+    if not has_a_plus:
+        return "NOK", "Sin contenido A+ configurado."
+
+    comp_count_val = comp_count or 0
+    has_price_val = bool(has_price)
+    has_reviews_val = bool(has_reviews)
+
+    issues = []
+    if not (settings.MIN_APLUS_COMPARATIVE_PRODUCTS <= comp_count_val <= settings.MAX_APLUS_COMPARATIVE_PRODUCTS):
+        issues.append(f"Productos en comparativa fuera de rango ({comp_count_val} de 4-6)")
+    if not has_price_val:
+        issues.append("Falta PVP en la tabla comparativa")
+    if not has_reviews_val:
+        issues.append("Faltan reseñas en la tabla comparativa")
+
+    if issues:
+        return "NOK", f"A+ Incompleto: {', '.join(issues)}"
+    return "OK", f"A+ Comparativa válida ({comp_count_val} productos)."
+
+def validate_reviews_sync(review_counts: List[int] | None) -> Tuple[str, str]:
+    """Regla 8: Mismo conteo exacto de reseñas consolidado en variantes."""
+    if review_counts is None:
+        return "N/A", "Sin datos de reseñas en SP-API."
+    if not review_counts:
+        return "NOK", "No se informaron reseñas por variante."
+
+    unique_counts = set(review_counts)
+    if len(unique_counts) == 1:
+        return "OK", f"Reseñas unificadas ({review_counts[0]} en todas las variantes)."
+    return "NOK", f"Reseñas no consolidadas entre variantes: {review_counts}"
+
+def evaluate_listing(input_data: ListingValidationInput) -> N8nListingOutput:
+    """Aplica las 8 reglas sobre los datos recibidos (Hardened)."""
+    status_val, status_note = validate_listing_status(input_data.is_active)
+    title_status, title_note = validate_title(input_data.title, input_data.title_max_length_override)
+    bullets_status, bullets_note = validate_bullet_points(input_data.bullet_points)
+    vars_status, vars_note = validate_variations(input_data.variation_asins)
+    imgs_status, imgs_note = validate_images(input_data.image_urls)
+    video_status, video_note = validate_video(input_data.has_video)
+    aplus_status, aplus_note = validate_a_plus_comparative(
+        input_data.has_a_plus,
+        input_data.a_plus_comparison_products_count,
+        input_data.a_plus_has_price,
+        input_data.a_plus_has_reviews
+    )
+    reviews_status, reviews_note = validate_reviews_sync(input_data.variant_review_counts)
+
+    failures = []
+
+    # Registrar fallo si el listing está inactivo
+    if status_val == "Inactivo":
+        failures.append(f"Listing Status: {status_note}")
+
+    checks = [
+        ("Titulo", title_status, title_note),
+        ("Bullets", bullets_status, bullets_note),
+        ("Variaciones", vars_status, vars_note),
+        ("Imagenes", imgs_status, imgs_note),
+        ("Video", video_status, video_note),
+        ("A+ Comparativa", aplus_status, aplus_note),
+        ("Reseñas", reviews_status, reviews_note),
+    ]
+
+    for name, st, note in checks:
+        if st == "NOK":
+            failures.append(f"{name}: {note}")
+
+    notas = " | ".join(failures) if failures else "Cumple 100% con SOP DOMY."
+
+    return N8nListingOutput(
+        asin=input_data.asin,
+        listing_status=status_val,
+        titulo=title_status,
+        bullet_points=bullets_status,
+        variaciones=vars_status,
+        imagenes_correctas=imgs_status,
+        video=video_status,
+        a_plus_comparativa=aplus_status,
+        resenas_juntas=reviews_status,
+        notas=notas
+    )
