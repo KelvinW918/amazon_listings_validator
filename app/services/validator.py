@@ -103,16 +103,27 @@ def validate_a_plus_comparative(
         return "NOK", f"A+ Incompleto: {', '.join(issues)}"
     return "OK", f"A+ Comparativa válida ({comp_count_val} productos)."
 
-def validate_reviews_sync(review_counts: List[int] | None) -> Tuple[str, str]:
-    """Regla 8: Mismo conteo exacto de reseñas consolidado en variantes."""
-    if review_counts is None:
-        return "N/A", "Sin datos de reseñas en SP-API."
-    if not review_counts:
-        return "NOK", "No se informaron reseñas por variante."
+def validate_reviews_sync(
+    review_counts: List[int] | None,
+    variation_asins: List[str] | None
+) -> Tuple[str, str]:
+    """Regla 8: Verifica la unificación de reseñas en productos con variaciones."""
 
+    # 1. Si no tiene variaciones, la regla de "reseñas juntas" no aplica
+    has_variations = bool(variation_asins and len(variation_asins) > 0)
+    if not has_variations:
+        return "N/A", "Producto individual sin variaciones."
+
+    # 2. Si tiene variaciones pero no recibimos datos de reseñas desde la API
+    if review_counts is None or len(review_counts) == 0:
+        return "N/A", "Sin datos de reseñas por variante en SP-API."
+
+    # 3. Filtrar conteos mayores a 0 si fuera necesario, o validar unificación
     unique_counts = set(review_counts)
+
     if len(unique_counts) == 1:
         return "OK", f"Reseñas unificadas ({review_counts[0]} en todas las variantes)."
+
     return "NOK", f"Reseñas no consolidadas entre variantes: {review_counts}"
 
 def evaluate_listing(input_data: ListingValidationInput) -> N8nListingOutput:
@@ -129,7 +140,10 @@ def evaluate_listing(input_data: ListingValidationInput) -> N8nListingOutput:
         input_data.a_plus_has_price,
         input_data.a_plus_has_reviews
     )
-    reviews_status, reviews_note = validate_reviews_sync(input_data.variant_review_counts)
+    reviews_status, reviews_note = validate_reviews_sync(
+        input_data.variant_review_counts,
+        input_data.variation_asins
+    )
 
     failures = []
 

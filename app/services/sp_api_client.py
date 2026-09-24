@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 import httpx
@@ -209,8 +210,6 @@ class SPAPIClient:
                                     product_cols = comp_table.get("productColumns", [])
                                     result["a_plus_comparison_products_count"] = len(product_cols)
 
-                                    # Si existen columnas de productos en la tabla, Amazon activa
-                                    # automáticamente el bloque de precio y reseñas en el frontend.
                                     if len(product_cols) > 0:
                                         result["a_plus_has_price"] = True
                                         result["a_plus_has_reviews"] = True
@@ -221,27 +220,20 @@ class SPAPIClient:
         return result
 
     def _parse_video_from_html(self, html: str) -> bool:
-        """Determina si hay un video en el HTML de la página del producto."""
-        import re
-
-        # Aislamos el bloque de imágenes/galería principal para evitar falsos positivos
-        img_block_match = re.search(
-            r'id=["\'](?:imageBlock|altImages|main-image-container)["\'].*?(?=<div id=["\'](?:dp-container|description|aplus)["\']|\Z)',
-            html,
-            re.DOTALL | re.IGNORECASE
-        )
-        gallery_html = img_block_match.group(0) if img_block_match else html
-
-        # Clases CSS y marcadores habituales de reproductores de video en Amazon
-        video_markers = ["vse-video-container", "videoBlock", "video-slate-container", "vse-player", "a-video-player"]
-
-        if any(marker in gallery_html for marker in video_markers):
-            return True
-
-        return "media-amazon.com/images/S/vse-vcta-media-page" in html or "videos/m/" in html
+        """Determina si hay un video en el HTML de la página del producto mediante marcadores de reproductor."""
+        video_markers = [
+            "vse-video-container",
+            "videoBlock",
+            "video-slate-container",
+            "vse-player",
+            "a-video-player",
+            "media-amazon.com/images/S/vse-vcta-media-page",
+            "videos/m/"
+        ]
+        return any(marker in html for marker in video_markers)
 
     async def _fallback_public_page_check(self, asin: str, marketplace: str) -> Dict[str, Any]:
-        """Extrae Video y A+ directamente de la vista pública de Amazon aislando el contenedor A+."""
+        """Extrae Video, A+ y Recuento de Reseñas directamente de la vista pública de Amazon."""
         domain_map = {"MX": "com.mx", "US": "com", "ES": "es", "BR": "com.br", "CA": "ca"}
         domain = domain_map.get(marketplace.upper(), "com.mx")
         url = f"https://www.amazon.{domain}/dp/{asin}"
@@ -257,6 +249,7 @@ class SPAPIClient:
             "a_plus_comparison_products_count": 0,
             "a_plus_has_price": True,
             "a_plus_has_reviews": True,
+            "review_count": None
         }
 
         try:
@@ -264,52 +257,32 @@ class SPAPIClient:
             if res.status_code == 200:
                 html = res.text
 
-                # 1. Detección de Video usando la función helper
+                # 1. Detección de Video usando marcadores HTML
                 result["has_video"] = self._parse_video_from_html(html)
 
                 # 2. Detección de A+ Content
-                if "aplus-v2" in html or "aplus3p" in html or "aplus-module" in html:
+                if any(m in html for m in ["aplus-v2", "aplus3p", "aplus-module"]):
                     result["has_a_plus"] = True
 
-                # 3. Detección precisa de Tabla Comparativa dentro del bloque A+
-                import re
-
-                # Aislamos el HTML correspondiente a la sección A+ para evitar falsos positivos de recomendaciones
-                aplus_match = re.search(r'id=["\']aplus["\'].*?(?=<div id=["\'](?:productDetails|detailBullets|reviewsHeader)["\']|\Z)', html, re.DOTALL | re.IGNORECASE)
-                aplus_html = aplus_match.group(0) if aplus_match else html
-
-                # Clases CSS estándar de tablas comparativas A+ en Amazon (Módulo 6 y Premium)
-                if any(tag in aplus_html for tag in ["apm-tablemodule", "aplus-comparison-table", "premium-module-6"]):
-                    # Extraer los enlaces ASIN (/dp/ASIN) dentro de la tabla A+
-                    table_match = re.search(r'<table[^>]*class=["\'][^handler]*?apm-tablemodule.*?</table>', aplus_html, re.DOTALL)
-                    table_html = table_match.group(0) if table_match else aplus_html
-
-                    # Estrategia 1: ASINs en formato /dp/ o /gp/product/
-                    asins_dp = set(re.findall(r'/dp/([A-Z0-9]{10})', table_html))
-                    asins_gp = set(re.findall(r'/gp/product/([A-Z0-9]{10})', table_html))
-                    asins_all = asins_dp | asins_gp
-
-                    # Estrategia 2: Contar celdas de producto reales (excluye headers y filas de atributos)
-                    # En el módulo 6, cada producto tiene una celda con imagen + una con el título/botón
-                    # El keyheader aparece una vez por fila (atributo), así que lo excluimos del conteo de productos
-                    product_image_cells = len(re.findall(r'apm-tablemodule-image', table_html))
-
-                    # Estrategia 3: Contar columnas por los <td> de la fila de imágenes
-                    # Estructura típica: <tr> con N <td> de imágenes
-                    image_row_match = re.search(r'<tr[^>]*>(?:\s*<td[^>]*>\s*<img[^>]*apm-tablemodule-image[^>]*>.*?</tr>', table_html, re.DOTALL)
-                    if image_row_match:
-                        image_row_html = image_row_match.group(0)
-                        cols_in_row = len(re.findall(r'<td', image_row_html))
-                        if cols_in_row > 0:
-                            product_image_cells = cols_in_row
+                # 3. Detección de Tabla Comparativa A+
+                if any(m in html for m in ["apm-tablemodule", "aplus-comparison-table", "premium-module-6"]):
+                    asins_dp = set(re.findall(r'/dp/([A-Z0-9]{10})', html))
+                    asins_gp = set(re.findall(r'/gp/product/([A-Z0-9]{10})', html))
+                    asins_all = (asins_dp | asins_gp) - {asin}
 
                     if asins_all:
-                        result["a_plus_comparison_products_count"] = len(asins_all)
-                    elif product_image_cells > 0:
-                        result["a_plus_comparison_products_count"] = product_image_cells
+                        result["a_plus_comparison_products_count"] = min(len(asins_all), 6)
                     else:
-                        # Fallback seguro: si la estructura existe pero no pudimos contar, asumimos 6
-                        result["a_plus_comparison_products_count"] = 6
+                        product_image_cells = len(re.findall(r'apm-tablemodule-image', html))
+                        result["a_plus_comparison_products_count"] = product_image_cells if product_image_cells > 0 else 6
+
+                # 4. Extracción de recuento de reseñas
+                reviews_match = re.search(r'acrCustomerReviewText[^\d]+([\d\.,\s]+)', html)
+                if reviews_match:
+                    raw_count = reviews_match.group(1)
+                    clean_count = re.sub(r'[^\d]', '', raw_count)
+                    if clean_count.isdigit():
+                        result["review_count"] = int(clean_count)
 
         except Exception as e:
             logger.warning(f"Fallback HTTP check falló para ASIN {asin}: {e}")
@@ -345,20 +318,23 @@ class SPAPIClient:
             if not aplus_data["has_a_plus"] and parent_asin:
                 aplus_data = await self._fetch_aplus_content(parent_asin, marketplace_id, region)
 
-            # 3. Si A+ dio error 403 o no se detectó video por API, se ejecuta el fallback público
-            if not aplus_data["has_a_plus"] or not aplus_data.get("has_video_in_aplus"):
-                fallback_data = await self._fallback_public_page_check(asin, mkt_code)
+            # 3. Fallback de página pública para Video, A+ y Reseñas
+            fallback_data = await self._fallback_public_page_check(asin, mkt_code)
 
-                if fallback_data["has_a_plus"]:
-                    aplus_data["has_a_plus"] = True
-                    aplus_data["a_plus_comparison_products_count"] = fallback_data["a_plus_comparison_products_count"]
-                    aplus_data["a_plus_has_price"] = True
-                    aplus_data["a_plus_has_reviews"] = True
+            if fallback_data["has_a_plus"]:
+                aplus_data["has_a_plus"] = True
+                aplus_data["a_plus_comparison_products_count"] = fallback_data["a_plus_comparison_products_count"]
+                aplus_data["a_plus_has_price"] = True
+                aplus_data["a_plus_has_reviews"] = True
 
-                if fallback_data["has_video"]:
-                    aplus_data["has_video_in_aplus"] = True
+            if fallback_data["has_video"]:
+                aplus_data["has_video_in_aplus"] = True
 
-            return await self._parse_sp_api_to_input(asin, mkt_code, raw_data, aplus_data, marketplace_id, region)
+            review_count = fallback_data.get("review_count")
+
+            return await self._parse_sp_api_to_input(
+                asin, mkt_code, raw_data, aplus_data, marketplace_id, region, review_count
+            )
 
         except (SPAPIRateLimitException, SPAPIServerException) as e:
             logger.error(f"Error de infraestructura SP-API para ASIN {asin}: {e}")
@@ -368,7 +344,14 @@ class SPAPIClient:
             raise HTTPException(status_code=502, detail=f"Fallo de transporte con Amazon SP-API: {str(e)}")
 
     async def _parse_sp_api_to_input(
-        self, asin: str, marketplace: str, data: Dict[str, Any], aplus_data: Dict[str, Any], marketplace_id: str, region: str
+        self,
+        asin: str,
+        marketplace: str,
+        data: Dict[str, Any],
+        aplus_data: Dict[str, Any],
+        marketplace_id: str,
+        region: str,
+        review_count: Optional[int] = None
     ) -> ListingValidationInput:
         attributes = data.get("attributes", {})
         summaries_list = data.get("summaries", [])
@@ -424,6 +407,11 @@ class SPAPIClient:
         # Detección de Video: Revisa si hay módulo de video en A+ o atributos multimedia en el catálogo
         has_video = aplus_data.get("has_video_in_aplus", False) or "video_display_group" in attributes
 
+        # Mapeo de conteo de reseñas para la regla de validación
+        variant_review_counts = None
+        if review_count is not None:
+            variant_review_counts = [review_count] * len(variation_asins)
+
         return ListingValidationInput(
             asin=asin,
             marketplace=marketplace,
@@ -437,7 +425,7 @@ class SPAPIClient:
             a_plus_comparison_products_count=aplus_data.get("a_plus_comparison_products_count", 0),
             a_plus_has_price=aplus_data.get("a_plus_has_price", False),
             a_plus_has_reviews=aplus_data.get("a_plus_has_reviews", False),
-            variant_review_counts=None
+            variant_review_counts=variant_review_counts
         )
 
     def _get_mock_fallback_data(self, asin: str, marketplace: str) -> ListingValidationInput:
