@@ -107,24 +107,40 @@ def validate_reviews_sync(
     review_counts: List[int] | None,
     variation_asins: List[str] | None
 ) -> Tuple[str, str]:
-    """Regla 8: Verifica la unificación de reseñas en productos con variaciones."""
+    """
+    Regla 8: Verifica la unificación de reseñas en productos con variaciones.
+
+    Lógica de evaluación:
+    1. Si NO hay variaciones (producto único) -> N/A (la regla no aplica).
+    2. Si HAY variaciones (familia Parent/Child con 2+ ASINs):
+       a. Si tenemos datos numéricos de reseñas por variante:
+          - Si todos los conteos son iguales -> OK (reseñas unificadas).
+          - Si hay discrepancia -> NOK (reseñas fragmentadas).
+       b. Si NO tenemos datos numéricos (SP-API no expone el conteo por variante):
+          - Asumir OK por estar en una familia con variaciones.
+            Amazon unifica las reseñas a nivel de familia cuando el seller
+            ha configurado correctamente el Parent/Child. La ausencia de
+            métricas individuales no debe penalizar al listing.
+    """
 
     # 1. Si no tiene variaciones, la regla de "reseñas juntas" no aplica
-    has_variations = bool(variation_asins and len(variation_asins) > 0)
+    has_variations = bool(variation_asins and len(variation_asins) > 1)
     if not has_variations:
         return "N/A", "Producto individual sin variaciones."
 
-    # 2. Si tiene variaciones pero no recibimos datos de reseñas desde la API
-    if review_counts is None or len(review_counts) == 0:
-        return "N/A", "Sin datos de reseñas por variante en SP-API."
+    # 2. Si tiene variaciones y SÍ recibimos datos de reseñas desde la API
+    if review_counts is not None and len(review_counts) > 0:
+        unique_counts = set(review_counts)
 
-    # 3. Filtrar conteos mayores a 0 si fuera necesario, o validar unificación
-    unique_counts = set(review_counts)
+        if len(unique_counts) == 1:
+            return "OK", f"Reseñas unificadas ({review_counts[0]} en todas las variantes)."
 
-    if len(unique_counts) == 1:
-        return "OK", f"Reseñas unificadas ({review_counts[0]} en todas las variantes)."
+        return "NOK", f"Reseñas no consolidadas entre variantes: {review_counts}"
 
-    return "NOK", f"Reseñas no consolidadas entre variantes: {review_counts}"
+    # 3. Si tiene variaciones pero NO tenemos la métrica individual de reviews por SP-API,
+    #    asumir OK por estar en una familia con variaciones unificadas.
+    #    La ausencia de datos no debe penalizar al listing.
+    return "OK", f"Familia con {len(variation_asins)} variantes. Reseñas unificadas por defecto (sin desglose por SP-API)."
 
 def evaluate_listing(input_data: ListingValidationInput) -> N8nListingOutput:
     """Aplica las 8 reglas sobre los datos recibidos (Hardened)."""
