@@ -127,3 +127,14 @@ class N8nListingOutput(BaseModel):
         default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         alias="Fecha"
     )
+
+# ========================================================================
+# MODELOS PARA LA FASE 2: AUDITORÍA DE VISIÓN E INTELIGENCIA ARTIFICIAL
+# ========================================================================
+
+class ImageVisionAnalysys(BaseModel):
+    """Resultados detallados del análisis multimodal / visión sobre las imágenes del listing."""
+    is_main_background_white: bool = Field(
+        default=True,
+        description="Indica si la imagen principal tiene fondo blanco puro"
+    )
