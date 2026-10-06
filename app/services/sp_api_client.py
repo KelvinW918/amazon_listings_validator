@@ -503,33 +503,82 @@ class SPAPIClient:
         retry_delay: float = 0.0
     ) -> Optional[str]:
         """
-        Descarga el HTML público usando curl_cffi con impersonación de navegador real.
-        Reduce CAPTCHA de ~98% a ~6%.
-
-        Devuelve None si falla, hay CAPTCHA o error de red.
+        Descarga el HTML público con curl_cffi (impersonación TLS real).
+        Cobertura completa: 18 marketplaces (los mismos que están en config.MARKETPLACE_IDS).
         """
         if retry_delay > 0:
             logger.info(f"⏳ Esperando {retry_delay}s antes de scrapear {asin} (anti-CAPTCHA)")
             await asyncio.sleep(retry_delay)
 
-        domain_map = {"MX": "com.mx", "US": "com", "ES": "es", "BR": "com.br", "CA": "ca"}
-        domain = domain_map.get(marketplace.upper(), "com.mx")
+        # ─── MAPA DE DOMINIOS: 1:1 con MARKETPLACE_IDS de config.py ───
+        domain_map = {
+            # Europa occidental
+            "ES": "es",
+            "DE": "de",
+            "FR": "fr",
+            "IT": "it",
+            "UK": "co.uk",
+            "NL": "nl",
+            "BE": "com.be",
+            "IE": "ie",
+            # Europa del norte / este
+            "SE": "se",
+            "PL": "pl",
+            # Medio Oriente
+            "TR": "com.tr",
+            "AE": "ae",
+            "SA": "sa",
+            # Norteamérica
+            "US": "com",
+            "CA": "ca",
+            "MX": "com.mx",
+            # Lejano Oriente
+            "JP": "co.jp",
+            "AU": "com.au",
+        }
+
+        mp_upper = marketplace.upper()
+        domain = domain_map.get(mp_upper)
+
+        if not domain:
+            logger.warning(
+                f"⚠️ [SCRAPE] Marketplace '{marketplace}' no está en domain_map. "
+                f"Cayendo a amazon.com como fallback seguro."
+            )
+            domain = "com"
+
         url = f"https://www.amazon.{domain}/dp/{asin}"
 
-        # Accept-Language adaptado al marketplace
-        accept_lang = {
+        # ─── ACCEPT-LANGUAGE: 1:1 con los 18 marketplaces ───
+        accept_lang_map = {
             "ES": "es-ES,es;q=0.9,en;q=0.8",
-            "US": "en-US,en;q=0.9",
-            "MX": "es-MX,es;q=0.9,en;q=0.8",
             "DE": "de-DE,de;q=0.9,en;q=0.8",
             "FR": "fr-FR,fr;q=0.9,en;q=0.8",
             "IT": "it-IT,it;q=0.9,en;q=0.8",
+            "UK": "en-GB,en;q=0.9",
+            "NL": "nl-NL,nl;q=0.9,en;q=0.8",
+            "BE": "nl-BE,nl;q=0.9,fr-BE;q=0.8,en;q=0.7",
+            "IE": "en-IE,en;q=0.9",
+            "SE": "sv-SE,sv;q=0.9,en;q=0.8",
+            "PL": "pl-PL,pl;q=0.9,en;q=0.8",
+            "TR": "tr-TR,tr;q=0.9,en;q=0.8",
+            "AE": "ar-AE,ar;q=0.9,en;q=0.8",
+            "SA": "ar-SA,ar;q=0.9,en;q=0.8",
+            "US": "en-US,en;q=0.9",
             "CA": "en-CA,en;q=0.9,fr-CA;q=0.8",
-            "BR": "pt-BR,pt;q=0.9,en;q=0.8",
-        }.get(marketplace.upper(), "en-US,en;q=0.9")
+            "MX": "es-MX,es;q=0.9,en;q=0.8",
+            "JP": "ja-JP,ja;q=0.9,en;q=0.8",
+            "AU": "en-AU,en;q=0.9",
+        }
+        accept_lang = accept_lang_map.get(mp_upper, "en-US,en;q=0.9")
 
         chosen_impersonate = random.choice(IMPERSONATE_POOL)
         ua = random.choice(USER_AGENTS)
+
+        logger.info(
+            f"🌐 [SCRAPE REQUEST] ASIN: {asin} | Marketplace: {mp_upper} | "
+            f"URL: {url} | impersonate: {chosen_impersonate}"
+        )
 
         try:
             async with AsyncSession() as session:
@@ -548,7 +597,7 @@ class SPAPIClient:
                         "Sec-Fetch-Site": "none",
                         "Sec-Fetch-User": "?1",
                         "Upgrade-Insecure-Requests": "1",
-                        "Cookie": "session-id=123-4567890-1234567; i18n-prefs=EUR; lc-acbes=es_ES; sp-cdn=\"L5Z9:ES\";",
+                        "Cookie": "session-id=123-4567890-1234567; i18n-prefs=EUR; sp-cdn=\"L5Z9:ES\";",
                     },
                     timeout=15.0,
                     allow_redirects=True,
@@ -560,18 +609,19 @@ class SPAPIClient:
 
                 html = res.text
 
-                # Detección de CAPTCHA
+                # Detección de CAPTCHA ampliada
                 if (
                     "api-services-support@amazon.com" in html
                     or "validateCaptcha" in html
                     or "Type the characters you see" in html
+                    or "Robot Check" in html
                 ):
                     logger.warning(f"⚠️ [SCRAPE BLOCKED] CAPTCHA para ASIN {asin} ({marketplace})")
                     return None
 
                 logger.info(
                     f"✅ [SCRAPE OK] ASIN {asin} | {len(html)} chars | "
-                    f"impersonate: {chosen_impersonate}"
+                    f"impersonate: {chosen_impersonate} | domain: amazon.{domain}"
                 )
                 return html
 
