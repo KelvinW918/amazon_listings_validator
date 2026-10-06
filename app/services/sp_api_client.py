@@ -29,7 +29,6 @@ USER_AGENTS = [
 ]
 
 # Pool de impersonaciones de curl_cffi (rotación de fingerprint TLS)
-# NOTA: solo Chrome, ya que curl_cffi no soporta firefox115 en todas sus versiones
 IMPERSONATE_POOL = ["chrome120", "chrome124", "chrome131"]
 
 class SPAPIException(Exception): pass
@@ -50,8 +49,100 @@ class SPAPIClient:
             "FE": asyncio.Lock(),
         }
 
+        # 🔑 NUEVO: Sesión persistente para el scraping (mantiene cookies entre requests)
+        self._scrape_session: Optional[AsyncSession] = None
+        self._scrape_session_lock = asyncio.Lock()
+
     async def close(self):
+        """Cierra todas las sesiones activas."""
+        if self._scrape_session is not None:
+            try:
+                await self._scrape_session.close()
+            except Exception:
+                pass
+            self._scrape_session = None
         await self.client.aclose()
+
+    async def _get_scrape_session(self) -> AsyncSession:
+        """
+        Devuelve la sesión persistente de scraping.
+        La primera vez la crea; en llamadas posteriores reutiliza la misma
+        para mantener el cookie jar de Amazon.
+        """
+        async with self._scrape_session_lock:
+            if self._scrape_session is None:
+                self._scrape_session = AsyncSession()
+                logger.info("🍪 [SCRAPE SESSION] Nueva sesión persistente creada (cookie jar activo)")
+            return self._scrape_session
+
+    async def warmup_scrape_session(self) -> bool:
+        """
+        Solución 3: Pre-calentamiento real de la sesión de scraping.
+        Hace una petición real a Amazon con un ASIN conocido para:
+          - Cargar curl_cffi en memoria
+          - Establecer cookies de sesión con Amazon
+          - Reducir CAPTCHA en las primeras peticiones reales
+
+        Retorna True si el warmup tuvo éxito.
+        """
+        try:
+            logger.info("🔥 [SCRAPE WARMUP] Iniciando pre-calentamiento de sesión con Amazon...")
+
+            session = await self._get_scrape_session()
+
+            # Usamos un ASIN estable y conocido (ajusta si quieres usar otro)
+            warmup_asin = "B0F298DTW1"
+            warmup_url = f"https://www.amazon.es/dp/{warmup_asin}"
+
+            res = await session.get(
+                warmup_url,
+                impersonate="chrome124",
+                headers={
+                    "User-Agent": random.choice(USER_AGENTS),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+                timeout=15.0,
+                allow_redirects=True,
+            )
+
+            if res.status_code == 200:
+                has_captcha = (
+                    "api-services-support@amazon.com" in res.text
+                    or "validateCaptcha" in res.text
+                    or "Robot Check" in res.text
+                )
+                if has_captcha:
+                    logger.warning("⚠️ [SCRAPE WARMUP] Amazon devolvió CAPTCHA en warmup (IP bloqueada)")
+                    return False
+
+                # Verificar que obtuvimos HTML real (contiene marcadores conocidos)
+                has_real_html = (
+                    "imageBlock" in res.text
+                    or "landingImage" in res.text
+                    or "productTitle" in res.text
+                )
+                if has_real_html:
+                    logger.info(
+                        f"✅ [SCRAPE WARMUP] Sesión caliente OK | "
+                        f"{len(res.text)} chars | cookies establecidas"
+                    )
+                    return True
+                else:
+                    logger.warning("⚠️ [SCRAPE WARMUP] HTML sospechoso (sin marcadores esperados)")
+                    return False
+            else:
+                logger.warning(f"⚠️ [SCRAPE WARMUP] Status inesperado: {res.status_code}")
+                return False
+
+        except Exception as e:
+            logger.warning(f"⚠️ [SCRAPE WARMUP] Fallo: {e}")
+            return False
 
     def _normalize(self, marketplace: str) -> str:
         code = marketplace.strip().upper()
@@ -246,13 +337,8 @@ class SPAPIClient:
 
         html_low = html.lower()
 
-        # --- Paso 1: Aislar SOLO las listas de medios del producto ---
-        # Estas listas contienen exclusivamente las imágenes y videos del producto actual.
-        # `altImages` = thumbnails (incluye el thumbnail de video si existe).
-        # `desktop-media-mainView` = items principales (incluye el item de video si existe).
         safe_zones = []
 
-        # altImages: lista de thumbnails
         alt_match = re.search(
             r'<div[^>]*id=["\']altimages["\'][^>]*>.*?<ul[^>]*>(.*?)</ul>',
             html_low, re.DOTALL | re.IGNORECASE
@@ -260,7 +346,6 @@ class SPAPIClient:
         if alt_match:
             safe_zones.append(alt_match.group(1))
 
-        # desktop-media-mainView: lista de items principales
         main_match = re.search(
             r'<ul[^>]*class=["\'][^"\']*desktop-media-mainview[^"\']*["\'][^>]*>(.*?)</ul>',
             html_low, re.DOTALL | re.IGNORECASE
@@ -268,8 +353,6 @@ class SPAPIClient:
         if main_match:
             safe_zones.append(main_match.group(1))
 
-        # --- Paso 2: Marcadores de video DENTRO de las zonas seguras ---
-        # Si aislámos al menos una lista, buscamos solo ahí.
         if safe_zones:
             safe_area = " ".join(safe_zones)
             safe_markers = [
@@ -288,8 +371,6 @@ class SPAPIClient:
             )
             return found
 
-        # --- Paso 3: Fallback si no hay listas aislables ---
-        # Solo marcadores ultra-específicos que no aparecen en widgets de recomendaciones.
         ultra_specific = [
             'data-csa-c-media-type="video"',
             'id="videocount"',
@@ -303,11 +384,7 @@ class SPAPIClient:
     # PARSER DE A+ — Ampliado para amazon.es + diagnóstico de marcadores
     # =========================================================================
     def _parse_aplus_from_html(self, html: str, current_asin: str) -> Dict[str, Any]:
-        """
-        Parser de A+ ampliado con diagnóstico profundo.
-        Estrategias en cascada para detectar la tabla comparativa en cualquier variante
-        (US, ES, IT, DE, MX...).
-        """
+        """Parser de A+ ampliado con diagnóstico profundo."""
         result = {
             "has_a_plus": False,
             "a_plus_comparison_products_count": 0,
@@ -320,7 +397,6 @@ class SPAPIClient:
 
         html_low = html.lower()
 
-        # --- 1. Detección de presencia de A+ ---
         aplus_markers = [
             'id="aplus"', "id='aplus'",
             'id="aplus_feature_div"',
@@ -338,7 +414,6 @@ class SPAPIClient:
             logger.info(f"🔎 [A+ DIAGNOSTIC] ASIN: {current_asin} | Sin marcadores A+ → NO tiene A+")
             return result
 
-        # --- 2. Aislar el bloque A+ ---
         aplus_block = ""
         block_patterns = [
             r'<div[^>]*id=["\']aplus_feature_div["\'][^>]*>(.*?)(?=<div[^>]*id=["\'](?:productdetails|reviewsheader|sp_detail|customer_reviews|detailbullets)["\']|$)',
@@ -354,7 +429,6 @@ class SPAPIClient:
 
         search_area = aplus_block if aplus_block else html_low
 
-        # --- 3. DIAGNÓSTICO PROFUNDO ---
         table_classes = re.findall(r'<table[^>]*class=["\']([^"\']*)["\']', search_area)
         all_compar = set(re.findall(r'[a-z\-_]*compar[a-z\-_]*', search_area))
         all_table_classes = set(re.findall(r'class=["\']([^"\']*table[^"\']*)["\']', search_area))
@@ -365,16 +439,10 @@ class SPAPIClient:
             f"🔬 [A+ DEEP] ASIN: {current_asin} | "
             f"Bloque A+: {len(aplus_block)} chars | "
             f"Tables: {len(table_classes)} | "
-            f"Table classes: {table_classes[:5]} | "
             f"'compar' hits: {list(all_compar)[:10]} | "
-            f"Table-like classes: {list(all_table_classes)[:8]} | "
-            f"Aplus classes: {list(all_aplus_classes)[:8]} | "
             f"ASINs en bloque A+: {len(asins_in_block)} → {list(asins_in_block)[:8]}"
         )
 
-        # --- 4. ESTRATEGIA 1: Marcadores explícitos de tabla comparativa ---
-        # 🔑 CLAVE: Aislamos SOLO la tabla A+ para no contar ASINs del widget nativo
-        #          "Compare with similar items" (sims-comparisoncontainer)
         comparison_markers = [
             "standard-comparison-table",
             "premium-comparison-table",
@@ -385,16 +453,11 @@ class SPAPIClient:
             "aplus-tech-spec-table",
         ]
         if any(marker in search_area for marker in comparison_markers):
-            # Aislar la tabla A+ específica (no los widgets nativos de Amazon)
             table_block = ""
             table_patterns = [
-                # Tabla comparativa A+ estándar/premium (clase apm-tablemodule)
                 r'<table[^>]*class=["\'][^"\']*apm-tablemodule[^"\']*["\'][^>]*>.*?</table>',
-                # Tabla A+ con clase de comparación explícita
                 r'<table[^>]*class=["\'][^"\']*(?:standard|premium)-comparison-table[^"\']*["\'][^>]*>.*?</table>',
-                # Tabla con clase aplus-comparison-table
                 r'<table[^>]*class=["\'][^"\']*aplus-comparison-table[^"\']*["\'][^>]*>.*?</table>',
-                # Módulo 6 completo (envuelve la tabla)
                 r'<div[^>]*class=["\'][^"\']*premium-module-6[^"\']*["\'][^>]*>.*?(?=<div[^>]*class=["\'][^"\']*aplus-module|$)',
             ]
             for pattern in table_patterns:
@@ -403,19 +466,15 @@ class SPAPIClient:
                     table_block = m.group(0)
                     break
 
-            # Si aislamos la tabla, contamos ASINs SOLO ahí
             count_area = table_block if table_block else search_area
 
-            # Contar ASINs únicos excluyendo el ASIN actual
             asins_dp = set(re.findall(r'/dp/([A-Z0-9]{10})', count_area))
             asins_gp = set(re.findall(r'/gp/product/([A-Z0-9]{10})', count_area))
             asins_all = (asins_dp | asins_gp) - {current_asin}
 
             if asins_all:
-                # Cap a 6 para no salir del rango SOP
                 result["a_plus_comparison_products_count"] = min(len(asins_all), 6)
             else:
-                # Si no hay ASINs, contar celdas de imagen
                 img_cells = len(re.findall(r'apm-tablemodule-image', count_area))
                 header_cells = len(re.findall(r'apm-tablemodule-keyheader', count_area))
                 fallback = max(img_cells, header_cells, 4)
@@ -423,35 +482,30 @@ class SPAPIClient:
 
             logger.info(
                 f"✓ [A+ ESTRATEGIA 1] Tabla aislada: {len(table_block)} chars | "
-                f"ASINs únicos (sin widget comparativa): {len(asins_all)} → "
-                f"count final: {result['a_plus_comparison_products_count']}"
+                f"ASINs únicos: {len(asins_all)} → count final: {result['a_plus_comparison_products_count']}"
             )
             return result
 
-        # --- 5. ESTRATEGIA 2: ¿Hay ASINs en el bloque A+? (evidencia de comparativa) ---
         has_table_tag = "<table" in search_area
         if asins_in_block and (has_table_tag or len(asins_in_block) >= 3):
             count = min(len(asins_in_block), 6)
             if 4 <= count <= 6:
                 result["a_plus_comparison_products_count"] = count
-                logger.info(f"✓ [A+ ESTRATEGIA 2] {count} ASINs detectados en bloque A+ (con tabla={has_table_tag})")
+                logger.info(f"✓ [A+ ESTRATEGIA 2] {count} ASINs detectados en bloque A+")
                 return result
             elif count < 4 and has_table_tag:
                 result["a_plus_comparison_products_count"] = count
-                logger.info(f"✓ [A+ ESTRATEGIA 2-ALT] Tabla + {count} ASINs (<4) → count: {count}")
+                logger.info(f"✓ [A+ ESTRATEGIA 2-ALT] Tabla + {count} ASINs (<4)")
                 return result
 
-        # --- 6. ESTRATEGIA 3: Clases con "compar" en tablas ---
         if any("compar" in c.lower() for c in table_classes):
             fallback_count = max(len(asins_in_block), 4)
             result["a_plus_comparison_products_count"] = min(fallback_count, 6)
-            logger.info(f"✓ [A+ ESTRATEGIA 3] Tabla con 'compar' detectada → count: {result['a_plus_comparison_products_count']}")
+            logger.info(f"✓ [A+ ESTRATEGIA 3] Tabla con 'compar' → count: {result['a_plus_comparison_products_count']}")
             return result
 
-        # --- 7. Sin evidencia de tabla comparativa ---
         logger.warning(
-            f"⚠️ [A+ SIN TABLA] ASIN {current_asin} tiene A+ pero no se detectó tabla comparativa. "
-            f"ASINs en bloque: {len(asins_in_block)} | Tables: {len(table_classes)}"
+            f"⚠️ [A+ SIN TABLA] ASIN {current_asin} tiene A+ pero no se detectó tabla comparativa."
         )
         return result
 
@@ -494,7 +548,7 @@ class SPAPIClient:
         return None
 
     # =========================================================================
-    # FETCH DEL HTML PÚBLICO — curl_cffi + rotación de impersonate
+    # FETCH DEL HTML PÚBLICO — Sesión persistente + curl_cffi
     # =========================================================================
     async def _fetch_public_html(
         self,
@@ -503,38 +557,21 @@ class SPAPIClient:
         retry_delay: float = 0.0
     ) -> Optional[str]:
         """
-        Descarga el HTML público con curl_cffi (impersonación TLS real).
-        Cobertura completa: 18 marketplaces (los mismos que están en config.MARKETPLACE_IDS).
+        Descarga el HTML público con curl_cffi usando la sesión persistente.
+        La sesión compartida mantiene las cookies de Amazon entre requests,
+        reduciendo la probabilidad de CAPTCHA.
         """
         if retry_delay > 0:
             logger.info(f"⏳ Esperando {retry_delay}s antes de scrapear {asin} (anti-CAPTCHA)")
             await asyncio.sleep(retry_delay)
 
-        # ─── MAPA DE DOMINIOS: 1:1 con MARKETPLACE_IDS de config.py ───
         domain_map = {
-            # Europa occidental
-            "ES": "es",
-            "DE": "de",
-            "FR": "fr",
-            "IT": "it",
-            "UK": "co.uk",
-            "NL": "nl",
-            "BE": "com.be",
-            "IE": "ie",
-            # Europa del norte / este
-            "SE": "se",
-            "PL": "pl",
-            # Medio Oriente
-            "TR": "com.tr",
-            "AE": "ae",
-            "SA": "sa",
-            # Norteamérica
-            "US": "com",
-            "CA": "ca",
-            "MX": "com.mx",
-            # Lejano Oriente
-            "JP": "co.jp",
-            "AU": "com.au",
+            "ES": "es", "DE": "de", "FR": "fr", "IT": "it",
+            "UK": "co.uk", "NL": "nl", "BE": "com.be", "IE": "ie",
+            "SE": "se", "PL": "pl",
+            "TR": "com.tr", "AE": "ae", "SA": "sa",
+            "US": "com", "CA": "ca", "MX": "com.mx",
+            "JP": "co.jp", "AU": "com.au",
         }
 
         mp_upper = marketplace.upper()
@@ -549,7 +586,6 @@ class SPAPIClient:
 
         url = f"https://www.amazon.{domain}/dp/{asin}"
 
-        # ─── ACCEPT-LANGUAGE: 1:1 con los 18 marketplaces ───
         accept_lang_map = {
             "ES": "es-ES,es;q=0.9,en;q=0.8",
             "DE": "de-DE,de;q=0.9,en;q=0.8",
@@ -572,58 +608,63 @@ class SPAPIClient:
         }
         accept_lang = accept_lang_map.get(mp_upper, "en-US,en;q=0.9")
 
+        # 🔑 Rotación en CADA intento (no solo en el primero)
         chosen_impersonate = random.choice(IMPERSONATE_POOL)
         ua = random.choice(USER_AGENTS)
 
+        # Pequeño jitter aleatorio antes del request (evita patrones detectables)
+        jitter = random.uniform(0.3, 1.5)
+        await asyncio.sleep(jitter)
+
         logger.info(
             f"🌐 [SCRAPE REQUEST] ASIN: {asin} | Marketplace: {mp_upper} | "
-            f"URL: {url} | impersonate: {chosen_impersonate}"
+            f"URL: {url} | impersonate: {chosen_impersonate} | jitter: {jitter:.2f}s"
         )
 
         try:
-            async with AsyncSession() as session:
-                res = await session.get(
-                    url,
-                    impersonate=chosen_impersonate,
-                    headers={
-                        "User-Agent": ua,
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                        "Accept-Language": accept_lang,
-                        "Accept-Encoding": "gzip, deflate, br",
-                        "Cache-Control": "no-cache",
-                        "Pragma": "no-cache",
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": "none",
-                        "Sec-Fetch-User": "?1",
-                        "Upgrade-Insecure-Requests": "1",
-                        "Cookie": "session-id=123-4567890-1234567; i18n-prefs=EUR; sp-cdn=\"L5Z9:ES\";",
-                    },
-                    timeout=15.0,
-                    allow_redirects=True,
-                )
+            # 🔑 Usar la sesión persistente (comparte cookies entre requests)
+            session = await self._get_scrape_session()
 
-                if res.status_code != 200:
-                    logger.warning(f"Scrape ASIN {asin} devolvió status {res.status_code}")
-                    return None
+            res = await session.get(
+                url,
+                impersonate=chosen_impersonate,
+                headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language": accept_lang,
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+                timeout=15.0,
+                allow_redirects=True,
+            )
 
-                html = res.text
+            if res.status_code != 200:
+                logger.warning(f"Scrape ASIN {asin} devolvió status {res.status_code}")
+                return None
 
-                # Detección de CAPTCHA ampliada
-                if (
-                    "api-services-support@amazon.com" in html
-                    or "validateCaptcha" in html
-                    or "Type the characters you see" in html
-                    or "Robot Check" in html
-                ):
-                    logger.warning(f"⚠️ [SCRAPE BLOCKED] CAPTCHA para ASIN {asin} ({marketplace})")
-                    return None
+            html = res.text
 
-                logger.info(
-                    f"✅ [SCRAPE OK] ASIN {asin} | {len(html)} chars | "
-                    f"impersonate: {chosen_impersonate} | domain: amazon.{domain}"
-                )
-                return html
+            if (
+                "api-services-support@amazon.com" in html
+                or "validateCaptcha" in html
+                or "Type the characters you see" in html
+                or "Robot Check" in html
+            ):
+                logger.warning(f"⚠️ [SCRAPE BLOCKED] CAPTCHA para ASIN {asin} ({marketplace})")
+                return None
+
+            logger.info(
+                f"✅ [SCRAPE OK] ASIN {asin} | {len(html)} chars | "
+                f"impersonate: {chosen_impersonate} | domain: amazon.{domain}"
+            )
+            return html
 
         except Exception as e:
             logger.warning(f"Fallo de red al scrapear ASIN {asin}: {e}")
@@ -633,19 +674,30 @@ class SPAPIClient:
         self,
         asin: str,
         marketplace: str,
-        max_attempts: int = 2
+        max_attempts: int = 4
     ) -> Optional[str]:
         """
-        Intenta scrapear el ASIN con reintentos y delays crecientes.
-        Si el primer intento falla, espera 2.5s y reintenta con otro impersonate.
+        Intenta scrapear el ASIN con reintentos agresivos y delays crecientes.
+        Delays: 0s, 5s, 10s, 20s con jitter.
         """
         for attempt in range(1, max_attempts + 1):
-            delay = 0.0 if attempt == 1 else 2.5 * attempt
+            if attempt == 1:
+                delay = 0.0
+            else:
+                # Delays progresivos: 5s, 10s, 20s
+                delay = min(5.0 * (2 ** (attempt - 2)), 20.0)
+
             html = await self._fetch_public_html(asin, marketplace, retry_delay=delay)
             if html:
+                if attempt > 1:
+                    logger.info(f"✅ [RETRY OK] {asin} recuperado en intento {attempt}/{max_attempts}")
                 return html
+
             if attempt < max_attempts:
-                logger.info(f"↻ Reintentando scrape de {asin} (intento {attempt + 1}/{max_attempts})")
+                logger.info(
+                    f"↻ Reintentando scrape de {asin} "
+                    f"(intento {attempt + 1}/{max_attempts} en {delay * 2:.0f}s)"
+                )
 
         logger.warning(f"❌ Scrape de {asin} falló tras {max_attempts} intentos")
         return None
@@ -663,26 +715,23 @@ class SPAPIClient:
             "a_plus_has_price": True,
             "a_plus_has_reviews": True,
             "review_count": None,
-            "scrape_success": False,  # <-- Solución A: distinguir "no tiene" vs "no verificado"
+            "scrape_success": False,
         }
 
-        html = await self._fetch_public_html_with_retry(asin, marketplace, max_attempts=2)
+        html = await self._fetch_public_html_with_retry(asin, marketplace, max_attempts=4)
         if not html:
             return result
 
         result["scrape_success"] = True
 
-        # 1. Video
         result["has_video"] = self._parse_video_from_html(html)
 
-        # 2. A+
         aplus_parsed = self._parse_aplus_from_html(html, asin)
         result["has_a_plus"] = aplus_parsed.get("has_a_plus", False)
         result["a_plus_comparison_products_count"] = aplus_parsed.get("a_plus_comparison_products_count", 0)
         result["a_plus_has_price"] = aplus_parsed.get("a_plus_has_price", True)
         result["a_plus_has_reviews"] = aplus_parsed.get("a_plus_has_reviews", True)
 
-        # 3. Reviews
         result["review_count"] = self._parse_review_count_from_html(html)
 
         logger.info(
@@ -771,17 +820,14 @@ class SPAPIClient:
             return self._get_mock_fallback_data(asin, mkt_code)
 
         try:
-            # 1. Obtener datos del catálogo
             raw_data = await self._fetch_raw_catalog_item(asin, marketplace_id, region)
 
-            # 2. Extraer Parent ASIN
             parent_asin = self._extract_parent_asin(raw_data)
             if parent_asin:
                 logger.info(f"ASIN {asin} detectado como Hijo. Parent ASIN: {parent_asin}")
             else:
                 logger.info(f"ASIN {asin} no tiene Parent ASIN (standalone o padre directo).")
 
-            # 3. Resolver familia de variaciones
             variation_family = await self._resolve_variation_family(
                 asin=asin,
                 raw_data=raw_data,
@@ -790,20 +836,17 @@ class SPAPIClient:
                 region=region
             )
 
-            # 4. A+ vía SP-API (probablemente 403 si falta el rol)
             aplus_data = await self._fetch_aplus_content(asin, marketplace_id, region)
 
             if not aplus_data["has_a_plus"] and parent_asin:
                 logger.info(f"ASIN {asin} sin A+ directo. Reintentando A+ con Parent ASIN: {parent_asin}")
                 aplus_data = await self._fetch_aplus_content(parent_asin, marketplace_id, region)
 
-            # 5. Scrape del ASIN consultado
             fallback_data = await self._fallback_public_page_check(asin, mkt_code)
 
-            # 6. Si el hijo no tiene A+ pero hay un padre, scrapear el padre con retry
             if not fallback_data["has_a_plus"] and parent_asin and parent_asin != asin:
                 logger.info(f"ASIN {asin} sin A+ en HTML. Scrapeando padre {parent_asin} con retry...")
-                parent_html = await self._fetch_public_html_with_retry(parent_asin, mkt_code, max_attempts=2)
+                parent_html = await self._fetch_public_html_with_retry(parent_asin, mkt_code, max_attempts=3)
                 if parent_html:
                     parent_aplus = self._parse_aplus_from_html(parent_html, parent_asin)
                     if parent_aplus.get("has_a_plus"):
@@ -818,7 +861,6 @@ class SPAPIClient:
                     else:
                         logger.warning(f"Padre {parent_asin} scrapeado OK pero sin marcadores A+")
 
-            # 7. Consolidar A+ con fallback
             if fallback_data["has_a_plus"]:
                 aplus_data["has_a_plus"] = True
                 if not aplus_data.get("a_plus_comparison_products_count"):
@@ -833,11 +875,10 @@ class SPAPIClient:
             has_video_fallback = fallback_data.get("has_video", False)
             scrape_success = fallback_data.get("scrape_success", False)
 
-            # 8. Conteo de reviews del padre (para comparación real)
             review_count_parent = None
             if parent_asin and parent_asin != asin and review_count_child is not None:
                 try:
-                    parent_html_for_reviews = await self._fetch_public_html_with_retry(parent_asin, mkt_code, max_attempts=1)
+                    parent_html_for_reviews = await self._fetch_public_html_with_retry(parent_asin, mkt_code, max_attempts=2)
                     if parent_html_for_reviews:
                         review_count_parent = self._parse_review_count_from_html(parent_html_for_reviews)
                         logger.info(
@@ -886,16 +927,13 @@ class SPAPIClient:
         summaries_list = data.get("summaries", [])
         summaries = summaries_list[0] if summaries_list and isinstance(summaries_list, list) else {}
 
-        # 1. Título
         title = summaries.get("itemName", "") if isinstance(summaries, dict) else ""
         if not title and "item_name" in attributes:
             title = attributes["item_name"][0].get("value", "")
 
-        # 2. Bullet Points
         bullets_raw = attributes.get("bullet_point", [])
         bullet_points = [b.get("value", "") for b in bullets_raw] if isinstance(bullets_raw, list) else []
 
-        # 3. Imágenes
         image_urls = []
         images_list = data.get("images", [])
         if images_list and isinstance(images_list, list):
@@ -909,14 +947,8 @@ class SPAPIClient:
                         if variant:
                             seen_variants.add(variant)
 
-        # 4. Variaciones
         variation_asins = variation_family if variation_family else [asin]
 
-        # 5. Video integral con Solución A:
-        #    - Si scrape OK y detectó video → True
-        #    - Si scrape OK y NO detectó video → False (NOK legítimo)
-        #    - Si scrape FALLÓ pero A+ SP-API detectó video → True
-        #    - Si scrape FALLÓ y no hay evidencia → None (N/A, no castigar al listing)
         has_video_explicit = (
             has_video_fallback
             or aplus_data.get("has_video_in_aplus", False)
@@ -926,11 +958,10 @@ class SPAPIClient:
         if has_video_explicit:
             has_video: Optional[bool] = True
         elif scrape_success:
-            has_video = False  # Scrape OK, no hay video → NOK legítimo
+            has_video = False
         else:
-            has_video = None  # No se pudo verificar → N/A
+            has_video = None
 
-        # 6. Reviews por variante
         variant_review_counts: Optional[List[int]] = None
         if review_count_child is not None and review_count_parent is not None:
             if review_count_child == review_count_parent:
@@ -942,16 +973,15 @@ class SPAPIClient:
         elif review_count_parent is not None:
             variant_review_counts = [review_count_parent] * len(variation_asins)
 
-        # 7. A+ con Solución A: distinguir "no tiene" vs "no verificado"
         has_a_plus_sp = aplus_data.get("has_a_plus", False)
         a_plus_count = aplus_data.get("a_plus_comparison_products_count", 0)
 
         if has_a_plus_sp:
             has_a_plus: Optional[bool] = True
         elif scrape_success:
-            has_a_plus = False  # Scrape OK, no hay A+ → NOK legítimo
+            has_a_plus = False
         else:
-            has_a_plus = None  # No se pudo verificar → N/A
+            has_a_plus = None
 
         return ListingValidationInput(
             asin=asin,

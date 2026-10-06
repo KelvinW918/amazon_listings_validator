@@ -23,24 +23,19 @@ logger = logging.getLogger("main")
 # =========================================================================
 async def _prewarm_curl_cffi() -> bool:
     """
-    Carga la librería nativa de curl_cffi en memoria.
-    Evita el cold-init de ~5-15s en la primera petición real.
+    Pre-calentamiento REAL de la sesión de scraping.
+    Llama a warmup_scrape_session() que hace un request real a Amazon
+    para establecer cookies de sesión y reducir CAPTCHA.
     """
     try:
-        from curl_cffi.requests import AsyncSession
-
-        async with AsyncSession() as session:
-            # Petición ligera a un dominio externo para forzar la carga
-            # de libcurl-impersonate y el fingerprint TLS de Chrome.
-            await session.get(
-                "https://www.google.com",
-                impersonate="chrome124",
-                timeout=5.0,
-            )
-        logger.info("🔥 [LIFESPAN] curl_cffi cargado OK")
-        return True
+        success = await sp_api_client.warmup_scrape_session()
+        if success:
+            logger.info("🔥 [LIFESPAN] Sesión de scraping caliente OK")
+        else:
+            logger.warning("⚠️ [LIFESPAN] Warmup de sesión falló (posible CAPTCHA). El scraping usará retries agresivos.")
+        return success
     except Exception as e:
-        logger.warning(f"⚠️ [LIFESPAN] Fallo al pre-calentar curl_cffi: {e}")
+        logger.warning(f"⚠️ [LIFESPAN] Fallo al pre-calentar sesión: {e}")
         return False
 
 
