@@ -49,7 +49,7 @@ class SPAPIClient:
             "FE": asyncio.Lock(),
         }
 
-        # 🔑 NUEVO: Sesión persistente para el scraping (mantiene cookies entre requests)
+        # 🔑 Sesión persistente para el scraping (mantiene cookies entre requests)
         self._scrape_session: Optional[AsyncSession] = None
         self._scrape_session_lock = asyncio.Lock()
 
@@ -650,6 +650,17 @@ class SPAPIClient:
                 return None
 
             html = res.text
+
+            # 🔑 Validación de tamaño mínimo
+            # Amazon devuelve páginas de error/CAPTCHA con HTTP 200 pero
+            # solo ~300-350K chars. Las páginas reales pesan ~1.5-2.5M chars.
+            # Si el HTML es muy pequeño, es una página de bloqueo/error disfrazada.
+            if len(html) < 500_000:
+                logger.warning(
+                    f"⚠️ [SCRAPE TOO SMALL] ASIN {asin} | "
+                    f"solo {len(html)} chars (esperado >500K) → posible error/CAPTCHA"
+                )
+                return None
 
             if (
                 "api-services-support@amazon.com" in html
