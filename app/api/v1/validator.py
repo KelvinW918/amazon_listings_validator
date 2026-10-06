@@ -139,3 +139,23 @@ async def batch_fetch_and_evaluate(payload: BatchEvalRequest):
     results = await asyncio.gather(*(process_single_with_limit(item) for item in payload.items))
     logger.info(f"🏁 [BATCH FINALIZADO] Se procesaron {len(results)} de {total_items} ASINs correctamente.")
     return list(results)
+
+@router.get("/warmup")
+async def warmup():
+    """
+    Endpoint de pre-calentamiento real.
+    Ejecuta una consulta completa contra un ASIN de bajo riesgo
+    para forzar: LWA + SP-API + curl_cffi + Amazon scraping.
+    """
+    logger.info("🔥 [WARMUP] Iniciando pre-calentamiento completo...")
+    try:
+        # Usa un ASIN de tu propio catálogo (bajo riesgo, siempre activo)
+        result = await sp_api_client.fetch_catalog_item(
+            asin="B0F298DTW1",  # ASIN conocido que funciona
+            marketplace="ES"
+        )
+        logger.info(f"🔥 [WARMUP] OK: {result.asin} procesado")
+        return {"status": "warm", "asin": result.asin}
+    except Exception as e:
+        logger.warning(f"⚠️ [WARMUP] Fallo: {e}")
+        return {"status": "partial", "error": str(e)}
