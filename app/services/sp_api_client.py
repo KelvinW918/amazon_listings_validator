@@ -696,7 +696,7 @@ class SPAPIClient:
                 delay = 0.0
             else:
                 # Delays progresivos: 5s, 10s, 20s
-                delay = min(5.0 * (2 ** (attempt - 2)), 20.0)
+                delay = min(5.0 * (2 ** (attempt - 2)), 45.0)
 
             html = await self._fetch_public_html(asin, marketplace, retry_delay=delay)
             if html:
@@ -729,7 +729,7 @@ class SPAPIClient:
             "scrape_success": False,
         }
 
-        html = await self._fetch_public_html_with_retry(asin, marketplace, max_attempts=4)
+        html = await self._fetch_public_html_with_retry(asin, marketplace, max_attempts=6)
         if not html:
             return result
 
