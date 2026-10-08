@@ -36,7 +36,7 @@ class SPAPIRateLimitException(SPAPIException): pass
 class SPAPIServerException(SPAPIException): pass
 
 class SPAPIClient:
-    """Cliente multi-marketplace con integración nativa a Catalog API v2022-04-01 y A+ Content API v2020-11-01."""
+    """Cliente multi-marketplace con integración nativa a Catalog API v2022-04-01, A+ Content API v2020-11-01 y Product Pricing API v0."""
 
     def __init__(self):
         limits = httpx.Limits(max_keepalive_connections=100, max_connections=200)
@@ -261,6 +261,92 @@ class SPAPIClient:
             )
 
         return res.json()
+
+    # =========================================================================
+    # BUYABILITY — Product Pricing API (fuente oficial de estado)
+    # =========================================================================
+    async def _fetch_buyability_from_pricing_api(
+        self, asin: str, marketplace_id: str, region: str
+    ) -> Optional[bool]:
+        """
+        Detecta si el listing es comprable usando Product Pricing API v0.
+
+        Retorna:
+            True  → ≥1 oferta activa → Listing activo
+            False → 0 ofertas → Listing inactivo/no comprable
+            None  → Error en la consulta → N/A
+        """
+        try:
+            token = await self.get_lwa_access_token(region)
+            base_url = settings.REGION_ENDPOINTS[region]
+            headers = {"x-amz-access-token": token, "Content-Type": "application/json"}
+
+            res = await self._execute_http_get(
+                f"{base_url}/products/pricing/v0/items/{asin}/offers",
+                headers,
+                {"MarketplaceId": marketplace_id, "ItemCondition": "New"},
+            )
+
+            if res.status_code != 200:
+                logger.warning(
+                    f"⚠️ [PRICING] ASIN {asin} ({region}) → status {res.status_code}"
+                )
+                return None
+
+            data = res.json()
+            payload = data.get("payload", {})
+            summary = payload.get("Summary", {})
+            total_offers = summary.get("TotalOfferCount", 0)
+
+            logger.info(
+                f"💰 [PRICING] ASIN {asin} | Total ofertas: {total_offers} "
+                f"→ {'COMPRABLE' if total_offers > 0 else 'NO COMPRABLE'}"
+            )
+
+            return total_offers > 0
+
+        except Exception as e:
+            logger.warning(f"⚠️ [PRICING] Error consultando {asin}: {e}")
+            return None
+
+    async def _resolve_buyability(
+        self,
+        asin: str,
+        raw_data: Dict[str, Any],
+        marketplace_id: str,
+        region: str,
+    ) -> Optional[bool]:
+        """
+        Resuelve el estado de buyability del ASIN consultado, manejando
+        correctamente el caso de Parent ASINs.
+
+        Lógica:
+        - Si el ASIN es PADRE (tiene hijos directos) → los padres no tienen
+          ofertas propias en Amazon. Se consulta el estado del PRIMER HIJO
+          como proxy representativo del estado del grupo familiar.
+        - Si el ASIN es HIJO o STANDALONE → consultar directamente.
+
+        Retorna:
+            True / False / None (según Product Pricing API)
+        """
+        # Detectar si es PADRE consultando hijos directos en el payload
+        direct_children = self._extract_child_asins(raw_data)
+
+        if direct_children:
+            # Es PADRE → usar el primer hijo como proxy
+            proxy_asin = sorted(set(direct_children))[0]
+            logger.info(
+                f"👨 ASIN {asin} es PADRE con {len(direct_children)} hijos. "
+                f"Consultando buyability del hijo proxy: {proxy_asin}"
+            )
+            return await self._fetch_buyability_from_pricing_api(
+                proxy_asin, marketplace_id, region
+            )
+
+        # Es HIJO o STANDALONE → consultar directo
+        return await self._fetch_buyability_from_pricing_api(
+            asin, marketplace_id, region
+        )
 
     async def _fetch_aplus_content(self, asin: str, marketplace_id: str, region: str) -> Dict[str, Any]:
         """Consulta la A+ Content API para validar presencia de módulos, tablas comparativas y video."""
@@ -689,13 +775,13 @@ class SPAPIClient:
     ) -> Optional[str]:
         """
         Intenta scrapear el ASIN con reintentos agresivos y delays crecientes.
-        Delays: 0s, 5s, 10s, 20s con jitter.
+        Delays: 0s, 5s, 10s, 20s, 45s con jitter.
         """
         for attempt in range(1, max_attempts + 1):
             if attempt == 1:
                 delay = 0.0
             else:
-                # Delays progresivos: 5s, 10s, 20s
+                # Delays progresivos: 5s, 10s, 20s, 45s
                 delay = min(5.0 * (2 ** (attempt - 2)), 45.0)
 
             html = await self._fetch_public_html(asin, marketplace, retry_delay=delay)
@@ -867,6 +953,16 @@ class SPAPIClient:
             else:
                 logger.info(f"ASIN {asin} no tiene Parent ASIN (standalone o padre directo).")
 
+            # 🔑 NUEVO: Consultar buyability con manejo correcto de Parent ASIN
+            # Si el ASIN es PADRE → consultar al primer hijo como proxy
+            # Si es HIJO o STANDALONE → consultar directamente
+            pricing_buyable = await self._resolve_buyability(
+                asin=asin,
+                raw_data=raw_data,
+                marketplace_id=marketplace_id,
+                region=region,
+            )
+
             variation_family = await self._resolve_variation_family(
                 asin=asin,
                 raw_data=raw_data,
@@ -938,7 +1034,8 @@ class SPAPIClient:
                 review_count_child=review_count_child,
                 review_count_parent=review_count_parent,
                 has_video_fallback=has_video_fallback,
-                scrape_success=scrape_success
+                scrape_success=scrape_success,
+                is_buyable=pricing_buyable,
             )
 
         except (SPAPIRateLimitException, SPAPIServerException) as e:
@@ -960,7 +1057,8 @@ class SPAPIClient:
         review_count_child: Optional[int] = None,
         review_count_parent: Optional[int] = None,
         has_video_fallback: bool = False,
-        scrape_success: bool = False
+        scrape_success: bool = False,
+        is_buyable: Optional[bool] = None,
     ) -> ListingValidationInput:
         attributes = data.get("attributes", {})
         summaries_list = data.get("summaries", [])
@@ -1052,10 +1150,18 @@ class SPAPIClient:
         else:
             has_a_plus = None
 
+        # 🔑 Determinar el estado real del listing
+        # - Si Pricing API devolvió True/False → usar ese valor (oficial)
+        # - Si devolvió None → N/A (no verificable)
+        if is_buyable is not None:
+            is_active_value: Optional[bool] = is_buyable
+        else:
+            is_active_value = None
+
         return ListingValidationInput(
             asin=asin,
             marketplace=marketplace,
-            is_active=True,
+            is_active=is_active_value,
             title=title,
             bullet_points=bullet_points,
             variation_asins=variation_asins,
@@ -1088,5 +1194,6 @@ class SPAPIClient:
             a_plus_has_reviews=True,
             variant_review_counts=[45, 120]
         )
+
 
 sp_api_client = SPAPIClient()
