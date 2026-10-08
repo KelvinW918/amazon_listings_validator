@@ -791,29 +791,57 @@ class SPAPIClient:
         marketplace_id: str,
         region: str
     ) -> List[str]:
-        """Construye la lista completa de ASINs de la familia."""
-        family: set = {asin}
+        """
+        Construye la lista de variantes REALES (child ASINs) de la familia.
 
+        IMPORTANTE: NO incluimos el Parent ASIN porque es un contenedor virtual
+        que agrupa hijos, no una variante real del producto.
+
+        Casos:
+        1. ASIN es PADRE → devolvemos sus hijos (children)
+        2. ASIN es HIJO  → devolvemos sus hermanos (children del padre, incluyendo el propio ASIN)
+        3. ASIN standalone → devolvemos [asin] (1 elemento → N/A en la validación)
+
+        Esto evita falsos OK en listings con "single child family"
+        (padre con 1 solo hijo, que no son variaciones reales).
+        """
+        # Caso 1: El ASIN actual es PADRE → sus hijos son las variantes
         direct_children = self._extract_child_asins(raw_data)
         if direct_children:
-            family.update(direct_children)
-            logger.info(f"ASIN {asin} es PADRE. Hijos detectados: {len(direct_children)}")
-            return sorted(family)
+            unique_children = sorted(set(direct_children))
+            logger.info(
+                f"ASIN {asin} es PADRE. Variantes reales (hijos): {len(unique_children)} "
+                f"→ {unique_children[:5]}{'...' if len(unique_children) > 5 else ''}"
+            )
+            return unique_children
 
+        # Caso 2: El ASIN actual es HIJO → sus hermanos son las variantes
         if parent_asin:
-            family.add(parent_asin)
             try:
                 parent_data = await self._fetch_raw_catalog_item(parent_asin, marketplace_id, region)
                 siblings = self._extract_child_asins(parent_data)
                 if siblings:
-                    family.update(siblings)
-                    logger.info(f"ASIN {asin} es HIJO de {parent_asin}. Hermanos detectados: {len(siblings)}")
+                    unique_siblings = sorted(set(siblings))
+                    logger.info(
+                        f"ASIN {asin} es HIJO de {parent_asin}. Variantes reales (hermanos): {len(unique_siblings)} "
+                        f"→ {unique_siblings[:5]}{'...' if len(unique_siblings) > 5 else ''}"
+                    )
+                    return unique_siblings
                 else:
-                    logger.info(f"ASIN {asin} es HIJO de {parent_asin}, padre sin childAsins.")
+                    logger.info(
+                        f"ASIN {asin} es HIJO de {parent_asin}, pero el padre no expone childAsins. "
+                        f"Tratando como standalone."
+                    )
+                    return [asin]
             except Exception as e:
-                logger.warning(f"No se pudo enriquecer la familia desde el padre {parent_asin}: {e}")
+                logger.warning(
+                    f"No se pudo consultar el padre {parent_asin}: {e}. Tratando como standalone."
+                )
+                return [asin]
 
-        return sorted(family)
+        # Caso 3: ASIN standalone sin parent ni children
+        logger.info(f"ASIN {asin} es standalone (sin variaciones)")
+        return [asin]
 
     # =========================================================================
     # FLUJO PRINCIPAL
