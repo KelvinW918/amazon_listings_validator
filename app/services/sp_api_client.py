@@ -945,18 +945,48 @@ class SPAPIClient:
         bullets_raw = attributes.get("bullet_point", [])
         bullet_points = [b.get("value", "") for b in bullets_raw] if isinstance(bullets_raw, list) else []
 
-        image_urls = []
+        # =====================================================================
+        # 3. Imágenes — Agrupar por `variant` para contar imágenes reales
+        # =====================================================================
+        # Amazon devuelve cada imagen del carrusel en múltiples resoluciones
+        # (ej. 75px, 500px, 2000px) con el MISMO `variant` (MAIN, PT01, PT02...).
+        # Contar entries directamente da 3x el número real de imágenes.
+        #
+        # Solución: agrupar por `variant`, quedarnos con la URL de mayor
+        # resolución de cada uno, y devolver 1 URL por variant único.
+        # =====================================================================
+        variants_map: Dict[str, Dict[str, Any]] = {}
         images_list = data.get("images", [])
+        total_entries = 0
+
         if images_list and isinstance(images_list, list):
-            seen_variants = set()
             for img_container in images_list:
                 for img_data in img_container.get("images", []):
-                    variant = img_data.get("variant")
+                    total_entries += 1
+                    variant = img_data.get("variant") or "UNKNOWN"
                     link = img_data.get("link") or img_data.get("Link")
-                    if link and (variant not in seen_variants or not variant):
-                        image_urls.append(link)
-                        if variant:
-                            seen_variants.add(variant)
+                    if not link:
+                        continue
+
+                    height = img_data.get("height") or 0
+                    width = img_data.get("width") or 0
+                    size = max(int(height) if height else 0, int(width) if width else 0)
+
+                    current = variants_map.get(variant)
+                    if current is None or size > current["size"]:
+                        variants_map[variant] = {"url": link, "size": size}
+
+        # Ordenar por variant para que MAIN vaya primero, luego PT01, PT02...
+        image_urls: List[str] = [
+            variants_map[v]["url"] for v in sorted(variants_map.keys())
+        ]
+
+        logger.info(
+            f"📸 [IMAGES] ASIN {asin} | "
+            f"entries totales: {total_entries} | "
+            f"variants únicos: {len(variants_map)} | "
+            f"variants: {sorted(variants_map.keys())}"
+        )
 
         variation_asins = variation_family if variation_family else [asin]
 
