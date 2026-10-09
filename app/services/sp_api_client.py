@@ -467,6 +467,50 @@ class SPAPIClient:
         return found
 
     # =========================================================================
+    # PARSER DE CONTEO DE IMÁGENES DESDE HTML
+    # =========================================================================
+    def _parse_image_count_from_html(self, html: str, current_asin: str) -> Optional[int]:
+        """
+        Extrae el conteo de imágenes del carrusel desde el HTML público.
+        Sirve como override cuando SP-API devuelve menos imágenes que la página real.
+
+        Cuenta los <li class="imageThumbnail"> en altImages excluyendo el de video.
+        """
+        if not html:
+            return None
+
+        html_low = html.lower()
+
+        # Buscar el bloque altImages (carrusel de thumbnails)
+        alt_match = re.search(
+            r'<div[^>]*id=["\']altimages["\'][^>]*>(.*?)(?=<div[^>]*id=["\'](?:main-image-container|desktop-media)["\']|$)',
+            html_low, re.DOTALL | re.IGNORECASE
+        )
+        if not alt_match:
+            return None
+
+        alt_block = alt_match.group(1)
+
+        # Contar los <li> con clase "imageThumbnail" (imágenes del carrusel)
+        image_thumbnails = re.findall(
+            r'<li[^>]*class=["\'][^"\']*imagethumbnail[^"\']*["\'][^>]*>',
+            alt_block,
+            re.IGNORECASE
+        )
+
+        # Excluir los que tienen "videoThumbnail" en sus clases
+        image_count = sum(
+            1 for li in image_thumbnails
+            if "videothumbnail" not in li.lower()
+        )
+
+        if image_count > 0:
+            logger.info(f"📸 [HTML IMAGES] ASIN {current_asin} | contadas en HTML: {image_count}")
+            return image_count
+
+        return None
+
+    # =========================================================================
     # PARSER DE A+ — Ampliado para amazon.es + diagnóstico de marcadores
     # =========================================================================
     def _parse_aplus_from_html(self, html: str, current_asin: str) -> Dict[str, Any]:
@@ -775,13 +819,13 @@ class SPAPIClient:
     ) -> Optional[str]:
         """
         Intenta scrapear el ASIN con reintentos agresivos y delays crecientes.
-        Delays: 0s, 5s, 10s, 20s, 45s con jitter.
+        Delays: 0s, 3s, 6s, 10s con jitter.
         """
         for attempt in range(1, max_attempts + 1):
             if attempt == 1:
                 delay = 0.0
             else:
-                # Delays progresivos: 5s, 10s, 20s, 45s
+                # Delays progresivos: 3s, 6s, 10s
                 delay = min(3.0 * (2 ** (attempt - 2)), 10.0)
 
             html = await self._fetch_public_html(asin, marketplace, retry_delay=delay)
@@ -813,6 +857,7 @@ class SPAPIClient:
             "a_plus_has_reviews": True,
             "review_count": None,
             "scrape_success": False,
+            "image_count_from_html": None,  # 🔑 NUEVO
         }
 
         html = await self._fetch_public_html_with_retry(asin, marketplace, max_attempts=3)
@@ -822,6 +867,9 @@ class SPAPIClient:
         result["scrape_success"] = True
 
         result["has_video"] = self._parse_video_from_html(html)
+
+        # 🔑 NUEVO: contar imágenes del HTML
+        result["image_count_from_html"] = self._parse_image_count_from_html(html, asin)
 
         aplus_parsed = self._parse_aplus_from_html(html, asin)
         result["has_a_plus"] = aplus_parsed.get("has_a_plus", False)
@@ -834,7 +882,8 @@ class SPAPIClient:
         logger.info(
             f"🔎 [SCRAPE RESULT] ASIN: {asin} | Video: {result['has_video']} | "
             f"A+: {result['has_a_plus']} (comparativa: {result['a_plus_comparison_products_count']}) | "
-            f"Reviews: {result['review_count']}"
+            f"Reviews: {result['review_count']} | "
+            f"Images HTML: {result['image_count_from_html']}"
         )
 
         return result
@@ -953,7 +1002,7 @@ class SPAPIClient:
             else:
                 logger.info(f"ASIN {asin} no tiene Parent ASIN (standalone o padre directo).")
 
-            # 🔑 NUEVO: Consultar buyability con manejo correcto de Parent ASIN
+            # 🔑 Consultar buyability con manejo correcto de Parent ASIN
             # Si el ASIN es PADRE → consultar al primer hijo como proxy
             # Si es HIJO o STANDALONE → consultar directamente
             pricing_buyable = await self._resolve_buyability(
@@ -1009,6 +1058,7 @@ class SPAPIClient:
             review_count_child = fallback_data.get("review_count")
             has_video_fallback = fallback_data.get("has_video", False)
             scrape_success = fallback_data.get("scrape_success", False)
+            image_count_from_html = fallback_data.get("image_count_from_html")  # 🔑 NUEVO
 
             review_count_parent = None
             if parent_asin and parent_asin != asin and review_count_child is not None:
@@ -1036,6 +1086,7 @@ class SPAPIClient:
                 has_video_fallback=has_video_fallback,
                 scrape_success=scrape_success,
                 is_buyable=pricing_buyable,
+                image_count_from_html=image_count_from_html,  # 🔑 NUEVO
             )
 
         except (SPAPIRateLimitException, SPAPIServerException) as e:
@@ -1059,6 +1110,7 @@ class SPAPIClient:
         has_video_fallback: bool = False,
         scrape_success: bool = False,
         is_buyable: Optional[bool] = None,
+        image_count_from_html: Optional[int] = None,  # 🔑 NUEVO
     ) -> ListingValidationInput:
         attributes = data.get("attributes", {})
         summaries_list = data.get("summaries", [])
@@ -1135,8 +1187,20 @@ class SPAPIClient:
             f"entries totales: {total_entries} | "
             f"variants con nombre: {len(variants_map)} | "
             f"sin variant (únicos): {len(unique_no_variant)} | "
-            f"TOTAL: {len(image_urls)}"
+            f"TOTAL SP-API: {len(image_urls)}"
         )
+
+        # 🔑 OVERRIDE: Si el HTML tiene MÁS imágenes que SP-API, usar el conteo del HTML
+        # Esto corrige el caso donde SP-API no expone todas las imágenes del carrusel
+        if image_count_from_html and image_count_from_html > len(image_urls):
+            logger.info(
+                f"📸 [IMAGE OVERRIDE] ASIN {asin} | "
+                f"SP-API: {len(image_urls)} → HTML: {image_count_from_html} → usando {image_count_from_html}"
+            )
+            # Añadir URLs placeholder para que el conteo sea correcto
+            # (mantenemos las URLs reales de SP-API y añadimos placeholder para el delta)
+            while len(image_urls) < image_count_from_html:
+                image_urls.append(f"https://html-override.placeholder/{asin}_{len(image_urls)}.jpg")
 
         variation_asins = variation_family if variation_family else [asin]
 
