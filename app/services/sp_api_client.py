@@ -1074,14 +1074,27 @@ class SPAPIClient:
         # =====================================================================
         # 3. Imágenes — Agrupar por `variant` para contar imágenes reales
         # =====================================================================
-        # Amazon devuelve cada imagen del carrusel en múltiples resoluciones
-        # (ej. 75px, 500px, 2000px) con el MISMO `variant` (MAIN, PT01, PT02...).
-        # Contar entries directamente da 3x el número real de imágenes.
+        # Estrategia:
+        # - Si la imagen TIENE variant (MAIN, PT01...) → agrupar por variant
+        #   y quedarnos con la resolución más alta de cada uno.
+        # - Si la imagen NO tiene variant → tratar como única.
+        #   Deduplicar solo por URL base para evitar thumbnails duplicados.
         #
-        # Solución: agrupar por `variant`, quedarnos con la URL de mayor
-        # resolución de cada uno, y devolver 1 URL por variant único.
+        # Esto corrige el caso donde Amazon no etiqueta todas las imágenes con variant
+        # y antes se agrupaban todas bajo "UNKNOWN" como si fueran 1 sola.
         # =====================================================================
-        variants_map: Dict[str, Dict[str, Any]] = {}
+        def _url_base(url: str) -> str:
+            """Extrae el ID base de la URL de Amazon (sin sufijo de tamaño)."""
+            # Ejemplo: ".../I/41JMyhwFu9L._SL75_.jpg" → ".../I/41JMyhwFu9L"
+            return re.sub(
+                r'\._[A-Z0-9_,]+_\.(jpg|jpeg|png|webp|gif)$',
+                '',
+                url,
+                flags=re.IGNORECASE
+            )
+
+        variants_map: Dict[str, Dict[str, Any]] = {}       # Imágenes CON variant
+        unique_no_variant: Dict[str, Dict[str, Any]] = {}  # Imágenes SIN variant (dedupe por URL base)
         images_list = data.get("images", [])
         total_entries = 0
 
@@ -1089,7 +1102,7 @@ class SPAPIClient:
             for img_container in images_list:
                 for img_data in img_container.get("images", []):
                     total_entries += 1
-                    variant = img_data.get("variant") or "UNKNOWN"
+                    variant = img_data.get("variant")
                     link = img_data.get("link") or img_data.get("Link")
                     if not link:
                         continue
@@ -1098,20 +1111,31 @@ class SPAPIClient:
                     width = img_data.get("width") or 0
                     size = max(int(height) if height else 0, int(width) if width else 0)
 
-                    current = variants_map.get(variant)
-                    if current is None or size > current["size"]:
-                        variants_map[variant] = {"url": link, "size": size}
+                    if variant:
+                        # Tiene variant asignado (MAIN, PT01...)
+                        current = variants_map.get(variant)
+                        if current is None or size > current["size"]:
+                            variants_map[variant] = {"url": link, "size": size}
+                    else:
+                        # Sin variant → dedupe por URL base
+                        base = _url_base(link)
+                        current = unique_no_variant.get(base)
+                        if current is None or size > current["size"]:
+                            unique_no_variant[base] = {"url": link, "size": size}
 
-        # Ordenar por variant para que MAIN vaya primero, luego PT01, PT02...
-        image_urls: List[str] = [
-            variants_map[v]["url"] for v in sorted(variants_map.keys())
-        ]
+        # Combinar: primero los variants conocidos (ordenados), luego los sin-variant
+        image_urls: List[str] = []
+        for v in sorted(variants_map.keys()):
+            image_urls.append(variants_map[v]["url"])
+        for base in sorted(unique_no_variant.keys()):
+            image_urls.append(unique_no_variant[base]["url"])
 
         logger.info(
             f"📸 [IMAGES] ASIN {asin} | "
             f"entries totales: {total_entries} | "
-            f"variants únicos: {len(variants_map)} | "
-            f"variants: {sorted(variants_map.keys())}"
+            f"variants con nombre: {len(variants_map)} | "
+            f"sin variant (únicos): {len(unique_no_variant)} | "
+            f"TOTAL: {len(image_urls)}"
         )
 
         variation_asins = variation_family if variation_family else [asin]

@@ -1,4 +1,5 @@
 import re
+import html
 import unicodedata
 from typing import List, Tuple
 from app.core.config import settings
@@ -89,6 +90,11 @@ def validate_bullet_points(bullets: List[str]) -> Tuple[str, str]:
     errors = []
     for idx, bullet in enumerate(bullets, 1):
         bullet_clean = bullet.strip()
+
+        # 🔑 FIX: Decodificar HTML entities antes de medir longitud
+        # Ejemplo: "&amp;" → "&", "&lt;" → "<", "&#39;" → "'"
+        bullet_clean = html.unescape(bullet_clean)
+
         if len(bullet_clean) > settings.MAX_BULLET_CHARS:
             errors.append(f"B{idx} excede 250 chars ({len(bullet_clean)})")
         if not BULLET_FORMAT_REGEX.match(bullet_clean):
