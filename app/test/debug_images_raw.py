@@ -5,8 +5,8 @@ from app.services.sp_api_client import sp_api_client
 
 
 async def debug_images_raw():
-    asin = "B08K7QVC62"
-    marketplace = "FR"
+    asin = "B08BZJD9S4"
+    marketplace = "ES"
 
     print(f"🔍 Analizando imágenes RAW de {asin} ({marketplace})...\n")
 

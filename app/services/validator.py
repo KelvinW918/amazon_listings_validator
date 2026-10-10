@@ -41,6 +41,77 @@ BULLET_FORMAT_REGEX = re.compile(
 
 
 # =========================================================================
+# UTILIDADES DE MEDICIÓN VISIBLE DE BULLETS
+# =========================================================================
+# Problema: len() cuenta CODE POINTS, no caracteres visibles.
+# Emojis compuestos inflan el conteo dramáticamente:
+#   - "👨‍👩‍👧"  → len() = 7  (pero visualmente es 1 carácter)
+#   - "🇮🇹"    → len() = 2  (pero visualmente es 1 bandera)
+#   - "❤️"     → len() = 2  (corazón + variation selector)
+#   - "👍🏽"    → len() = 2  (emoji + modificador de tono)
+#
+# _visible_length() colapsa estas secuencias a 1 unidad antes de medir,
+# alineando el conteo con lo que el cliente ve en Amazon.
+# =========================================================================
+
+# Regex que captura una secuencia de emoji (con ZWJ opcional) + variation selector
+_EMOJI_SEQUENCE_RE = re.compile(
+    r'(?:'
+    r'[\U0001F000-\U0001FFFF'    # Emojis principales
+    r'\u2600-\u27BF'              # Símbolos misc + dingbats
+    r'\u2B00-\u2BFF'              # Misc symbols
+    r']'
+    r'(?:\u200D(?:'
+    r'[\U0001F000-\U0001FFFF'
+    r'\u2600-\u27BF'
+    r'\u2B00-\u2BFF'
+    r']))*'
+    r'[\uFE0F\u20E3]?'             # Variation selector / keycap
+    r')',
+    re.UNICODE
+)
+
+# Regex para eliminar etiquetas HTML residuales
+_HTML_TAG_STRIP_RE = re.compile(r'<[^>]+>')
+
+# Regex para normalizar espacios en blanco
+_WHITESPACE_NORMALIZE_RE = re.compile(r'\s+')
+
+
+def _visible_length(text: str) -> int:
+    """
+    Cuenta caracteres VISIBLES (no code points).
+
+    Colapsa secuencias de emoji complejas (ZWJ, banderas, variation selectors)
+    a una sola unidad antes de medir la longitud.
+
+    Ejemplos:
+        _visible_length("👨‍👩‍👧")  → 1
+        _visible_length("🇮🇹")    → 1
+        _visible_length("Hola 🚗") → 6
+    """
+    if not text:
+        return 0
+    normalized = unicodedata.normalize("NFC", text)
+    collapsed = _EMOJI_SEQUENCE_RE.sub("X", normalized)
+    return len(collapsed)
+
+
+def _clean_bullet_text(raw: str) -> str:
+    """
+    Limpieza defensiva de un bullet antes de validarlo.
+    Aunque el scraper ya limpia HTML, aplicamos esta capa por si algún bullet
+    se cuela con etiquetas tras cambios en SP-API o en el scraper.
+    """
+    if not raw:
+        return ""
+    text = _HTML_TAG_STRIP_RE.sub('', str(raw))
+    text = html.unescape(text)
+    text = _WHITESPACE_NORMALIZE_RE.sub(' ', text).strip()
+    return text
+
+
+# =========================================================================
 # REGLA 1 — ESTADO DEL LISTING
 # =========================================================================
 def validate_listing_status(status_input: bool | str | None) -> Tuple[str, str]:
@@ -83,21 +154,30 @@ def validate_title(title: str | None, max_override: int | None = None) -> Tuple[
 # REGLA 3 — BULLET POINTS
 # =========================================================================
 def validate_bullet_points(bullets: List[str]) -> Tuple[str, str]:
-    """Regla 3: Exactamente 5 bullets, ≤ 250 chars y formato Emoji + MAYÚSCULAS + :"""
+    """
+    Regla 3: Exactamente 5 bullets, ≤ 250 chars VISIBLES y formato Emoji + MAYÚSCULAS + :
+
+    Cambios clave respecto a versión anterior:
+      - Limpieza defensiva de HTML residual antes de medir.
+      - Uso de _visible_length() para que emojis ZWJ / banderas no inflen el conteo.
+    """
     if len(bullets) != settings.REQUIRED_BULLETS_COUNT:
         return "NOK", f"Cantidad incorrecta de bullets ({len(bullets)} de 5 requeridos)."
 
     errors = []
     for idx, bullet in enumerate(bullets, 1):
-        bullet_clean = bullet.strip()
+        # Limpieza defensiva (HTML tags + entidades + espacios)
+        bullet_clean = _clean_bullet_text(bullet)
 
-        # 🔑 FIX: Decodificar HTML entities antes de medir longitud
-        # Ejemplo: "&amp;" → "&", "&lt;" → "<", "&#39;" → "'"
-        bullet_clean = html.unescape(bullet_clean)
+        # 🔑 Medir longitud VISIBLE (no code points)
+        visible_len = _visible_length(bullet_clean)
+        if visible_len > settings.MAX_BULLET_CHARS:
+            errors.append(
+                f"B{idx} excede {settings.MAX_BULLET_CHARS} chars visibles ({visible_len})"
+            )
 
-        if len(bullet_clean) > settings.MAX_BULLET_CHARS:
-            errors.append(f"B{idx} excede 250 chars ({len(bullet_clean)})")
-        if not BULLET_FORMAT_REGEX.match(bullet_clean):
+        # Validar formato sobre el prefijo (algunos bullets tienen texto largo tras el formato)
+        if not BULLET_FORMAT_REGEX.match(bullet_clean[:80]):
             errors.append(f"B{idx} sin formato 'Emoji + MAYÚSCULAS + :'")
 
     if errors:
