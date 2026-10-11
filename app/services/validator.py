@@ -11,7 +11,7 @@ from app.models.listing import ListingValidationInput, N8nListingOutput
 # Soporta:
 #   - Múltiples emojis consecutivos (banderas 🇮🇹, ZWJ 👨‍👩‍👧, símbolos 🛡️)
 #   - Letras acentuadas de ES / IT / FR / DE
-#   - Símbolos comunes: guiones, paréntesis, slashes, apóstrofes
+#   - Símbolos comunes: guiones, comas, dos puntos, paréntesis, slashes, apóstrofes
 #
 # Formato esperado: <emoji(s)> <ESPACIO> <MAYÚSCULAS>: <texto>
 # =========================================================================
@@ -32,7 +32,8 @@ BULLET_FORMAT_REGEX = re.compile(
     r'ÁÉÍÓÚÑÜ'                    # Español
     r'ÀÈÌÒÙÂÊÎÔÛÄËÏÖÜÇŒÆ'         # Italiano / Francés / Alemán
     r'\-–—'
-    r'_()/.&\'`´'
+    r'_()/.&\'`´,'                # 🔑 AÑADIDA LA COMA
+    r':;!?'                       # 🔑 AÑADIDOS SIGNOS COMUNES
     r']+?'
     r'):'
     r'\s',

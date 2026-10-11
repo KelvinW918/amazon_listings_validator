@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import random
 import re
@@ -30,6 +31,52 @@ USER_AGENTS = [
 
 # Pool de impersonaciones de curl_cffi (rotación de fingerprint TLS)
 IMPERSONATE_POOL = ["chrome120", "chrome124", "chrome131"]
+
+
+# =============================================================================
+# LIMPIEZA DE BULLET POINTS
+# =============================================================================
+# SP-API devuelve los bullets con HTML crudo incrustado, por ejemplo:
+#   '<span style="font-family:Verdana;font-size:14px;">🚙 TEXTO:</span> descripción...'
+# Si no limpiamos ese HTML:
+#   1. Los tags cuentan como caracteres → falsos positivos de "excede 250 chars".
+#   2. El regex de formato 'Emoji + MAYÚSCULAS + :' falla porque el string
+#      empieza por '<' en lugar de por el emoji.
+# =============================================================================
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+_WHITESPACE_RE = re.compile(r'\s+')
+
+
+def _clean_bullet(raw_value: str) -> str:
+    """
+    Limpia un bullet proveniente de SP-API:
+      1. Elimina TODAS las etiquetas HTML (<span>, <b>, <br>, etc.).
+      2. Decodifica entidades HTML (&amp; → &, &#x1F699; → 🚙).
+      3. Normaliza espacios en blanco (\\n, \\t, espacios múltiples → 1 espacio).
+
+    Preserva emojis y caracteres Unicode nativos intactos.
+    """
+    if not raw_value:
+        return ""
+    # 1. Quitar etiquetas HTML
+    text = _HTML_TAG_RE.sub('', raw_value)
+    # 2. Decodificar entidades HTML
+    text = html.unescape(text)
+    # 3. Normalizar espacios en blanco
+    text = _WHITESPACE_RE.sub(' ', text).strip()
+    return text
+
+
+# =============================================================================
+# UMBRAL DE HTML COMPLETO (para detección fiable de A+)
+# =============================================================================
+# Amazon sirve versiones recortadas del HTML a bots/curl_cffi en algunos casos:
+#   - HTML completo: 1.5M - 2.5M chars → A+ detectable si existe
+#   - HTML recortado: ~800K chars → A+ omitido del final del documento
+# Si el HTML es más corto que este umbral, NO podemos afirmar que no tiene A+.
+# =============================================================================
+_HTML_COMPLETE_THRESHOLD = 1_200_000
+
 
 class SPAPIException(Exception): pass
 class SPAPIRateLimitException(SPAPIException): pass
@@ -484,7 +531,8 @@ class SPAPIClient:
         # Buscar el bloque altImages (carrusel de thumbnails)
         alt_match = re.search(
             r'<div[^>]*id=["\']altimages["\'][^>]*>(.*?)(?=<div[^>]*id=["\'](?:main-image-container|desktop-media)["\']|$)',
-            html_low, re.DOTALL | re.IGNORECASE
+            html_low,
+            re.DOTALL | re.IGNORECASE
         )
         if not alt_match:
             return None
@@ -846,8 +894,8 @@ class SPAPIClient:
     async def _fallback_public_page_check(self, asin: str, marketplace: str) -> Dict[str, Any]:
         """
         Extrae Video, A+, Reseñas y A+ Comparativa desde la vista pública de Amazon.
-        Incluye bandera `scrape_success` para que el motor pueda distinguir
-        entre "no tiene" y "no se pudo verificar".
+        Incluye banderas `scrape_success` y `html_complete` para que el motor
+        pueda distinguir entre "no tiene", "no se pudo verificar" y "HTML recortado".
         """
         result = {
             "has_video": False,
@@ -857,7 +905,8 @@ class SPAPIClient:
             "a_plus_has_reviews": True,
             "review_count": None,
             "scrape_success": False,
-            "image_count_from_html": None,  # 🔑 NUEVO
+            "image_count_from_html": None,
+            "html_complete": False,  # 🔑 NUEVO: indica si el HTML es completo (>= 1.2M chars)
         }
 
         html = await self._fetch_public_html_with_retry(asin, marketplace, max_attempts=3)
@@ -865,6 +914,8 @@ class SPAPIClient:
             return result
 
         result["scrape_success"] = True
+        # 🔑 NUEVO: determinar si el HTML es completo o recortado
+        result["html_complete"] = len(html) >= _HTML_COMPLETE_THRESHOLD
 
         result["has_video"] = self._parse_video_from_html(html)
 
@@ -872,10 +923,24 @@ class SPAPIClient:
         result["image_count_from_html"] = self._parse_image_count_from_html(html, asin)
 
         aplus_parsed = self._parse_aplus_from_html(html, asin)
-        result["has_a_plus"] = aplus_parsed.get("has_a_plus", False)
-        result["a_plus_comparison_products_count"] = aplus_parsed.get("a_plus_comparison_products_count", 0)
-        result["a_plus_has_price"] = aplus_parsed.get("a_plus_has_price", True)
-        result["a_plus_has_reviews"] = aplus_parsed.get("a_plus_has_reviews", True)
+        a_plus_detected = aplus_parsed.get("has_a_plus", False)
+
+        if a_plus_detected:
+            result["has_a_plus"] = True
+            result["a_plus_comparison_products_count"] = aplus_parsed.get("a_plus_comparison_products_count", 0)
+            result["a_plus_has_price"] = aplus_parsed.get("a_plus_has_price", True)
+            result["a_plus_has_reviews"] = aplus_parsed.get("a_plus_has_reviews", True)
+        elif not result["html_complete"]:
+            # 🔑 HTML recortado: NO podemos afirmar que no tiene A+ → indeterminado (None)
+            result["has_a_plus"] = None
+            logger.warning(
+                f"⚠️ [A+ INDETERMINADO] ASIN {asin} | "
+                f"HTML recortado ({len(html)} chars < {_HTML_COMPLETE_THRESHOLD}) "
+                f"→ no se puede confirmar ausencia de A+"
+            )
+        else:
+            # HTML completo + sin marcadores A+ → confirmado que NO tiene
+            result["has_a_plus"] = False
 
         result["review_count"] = self._parse_review_count_from_html(html)
 
@@ -883,7 +948,8 @@ class SPAPIClient:
             f"🔎 [SCRAPE RESULT] ASIN: {asin} | Video: {result['has_video']} | "
             f"A+: {result['has_a_plus']} (comparativa: {result['a_plus_comparison_products_count']}) | "
             f"Reviews: {result['review_count']} | "
-            f"Images HTML: {result['image_count_from_html']}"
+            f"Images HTML: {result['image_count_from_html']} | "
+            f"HTML complete: {result['html_complete']} ({len(html)} chars)"
         )
 
         return result
@@ -1028,6 +1094,9 @@ class SPAPIClient:
 
             fallback_data = await self._fallback_public_page_check(asin, mkt_code)
 
+            # 🔑 NUEVO: propagar html_complete
+            html_complete = fallback_data.get("html_complete", False)
+
             if not fallback_data["has_a_plus"] and parent_asin and parent_asin != asin:
                 logger.info(f"ASIN {asin} sin A+ en HTML. Scrapeando padre {parent_asin} con retry...")
                 parent_html = await self._fetch_public_html_with_retry(parent_asin, mkt_code, max_attempts=3)
@@ -1058,7 +1127,7 @@ class SPAPIClient:
             review_count_child = fallback_data.get("review_count")
             has_video_fallback = fallback_data.get("has_video", False)
             scrape_success = fallback_data.get("scrape_success", False)
-            image_count_from_html = fallback_data.get("image_count_from_html")  # 🔑 NUEVO
+            image_count_from_html = fallback_data.get("image_count_from_html")
 
             review_count_parent = None
             if parent_asin and parent_asin != asin and review_count_child is not None:
@@ -1086,7 +1155,8 @@ class SPAPIClient:
                 has_video_fallback=has_video_fallback,
                 scrape_success=scrape_success,
                 is_buyable=pricing_buyable,
-                image_count_from_html=image_count_from_html,  # 🔑 NUEVO
+                image_count_from_html=image_count_from_html,
+                html_complete=html_complete,  # 🔑 NUEVO
             )
 
         except (SPAPIRateLimitException, SPAPIServerException) as e:
@@ -1110,7 +1180,8 @@ class SPAPIClient:
         has_video_fallback: bool = False,
         scrape_success: bool = False,
         is_buyable: Optional[bool] = None,
-        image_count_from_html: Optional[int] = None,  # 🔑 NUEVO
+        image_count_from_html: Optional[int] = None,
+        html_complete: bool = False,  # 🔑 NUEVO
     ) -> ListingValidationInput:
         attributes = data.get("attributes", {})
         summaries_list = data.get("summaries", [])
@@ -1120,24 +1191,20 @@ class SPAPIClient:
         if not title and "item_name" in attributes:
             title = attributes["item_name"][0].get("value", "")
 
+        # 🔑 FIX BULLETS: limpiar HTML crudo incrustado por SP-API.
         bullets_raw = attributes.get("bullet_point", [])
-        bullet_points = [b.get("value", "") for b in bullets_raw] if isinstance(bullets_raw, list) else []
+        bullet_points = (
+            [_clean_bullet(b.get("value", "")) for b in bullets_raw]
+            if isinstance(bullets_raw, list) else []
+        )
+        # Filtrar bullets que quedaron vacíos tras la limpieza
+        bullet_points = [b for b in bullet_points if b]
 
         # =====================================================================
         # 3. Imágenes — Agrupar por `variant` para contar imágenes reales
         # =====================================================================
-        # Estrategia:
-        # - Si la imagen TIENE variant (MAIN, PT01...) → agrupar por variant
-        #   y quedarnos con la resolución más alta de cada uno.
-        # - Si la imagen NO tiene variant → tratar como única.
-        #   Deduplicar solo por URL base para evitar thumbnails duplicados.
-        #
-        # Esto corrige el caso donde Amazon no etiqueta todas las imágenes con variant
-        # y antes se agrupaban todas bajo "UNKNOWN" como si fueran 1 sola.
-        # =====================================================================
         def _url_base(url: str) -> str:
             """Extrae el ID base de la URL de Amazon (sin sufijo de tamaño)."""
-            # Ejemplo: ".../I/41JMyhwFu9L._SL75_.jpg" → ".../I/41JMyhwFu9L"
             return re.sub(
                 r'\._[A-Z0-9_,]+_\.(jpg|jpeg|png|webp|gif)$',
                 '',
@@ -1191,14 +1258,11 @@ class SPAPIClient:
         )
 
         # 🔑 OVERRIDE: Si el HTML tiene MÁS imágenes que SP-API, usar el conteo del HTML
-        # Esto corrige el caso donde SP-API no expone todas las imágenes del carrusel
         if image_count_from_html and image_count_from_html > len(image_urls):
             logger.info(
                 f"📸 [IMAGE OVERRIDE] ASIN {asin} | "
                 f"SP-API: {len(image_urls)} → HTML: {image_count_from_html} → usando {image_count_from_html}"
             )
-            # Añadir URLs placeholder para que el conteo sea correcto
-            # (mantenemos las URLs reales de SP-API y añadimos placeholder para el delta)
             while len(image_urls) < image_count_from_html:
                 image_urls.append(f"https://html-override.placeholder/{asin}_{len(image_urls)}.jpg")
 
@@ -1228,19 +1292,28 @@ class SPAPIClient:
         elif review_count_parent is not None:
             variant_review_counts = [review_count_parent] * len(variation_asins)
 
+        # =====================================================================
+        # 🔑 DETERMINACIÓN DE has_a_plus (con soporte para HTML recortado)
+        # =====================================================================
+        # Ramas:
+        #   1. A+ detectado (SP-API o HTML completo) → True
+        #   2. Scraper no llegó → None (N/A — no verificable)
+        #   3. Scraper llegó pero HTML recortado → None (N/A — no podemos confirmar ausencia)
+        #   4. Scraper llegó, HTML completo, sin A+ → False (NOK — confirmado sin A+)
+        # =====================================================================
         has_a_plus_sp = aplus_data.get("has_a_plus", False)
         a_plus_count = aplus_data.get("a_plus_comparison_products_count", 0)
 
         if has_a_plus_sp:
             has_a_plus: Optional[bool] = True
-        elif scrape_success:
-            has_a_plus = False
+        elif not scrape_success:
+            has_a_plus = None  # no se pudo verificar
+        elif not html_complete:
+            has_a_plus = None  # HTML recortado: indeterminado
         else:
-            has_a_plus = None
+            has_a_plus = False  # HTML completo + no detectado → confirmado sin A+
 
         # 🔑 Determinar el estado real del listing
-        # - Si Pricing API devolvió True/False → usar ese valor (oficial)
-        # - Si devolvió None → N/A (no verificable)
         if is_buyable is not None:
             is_active_value: Optional[bool] = is_buyable
         else:
