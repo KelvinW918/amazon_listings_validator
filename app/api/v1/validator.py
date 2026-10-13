@@ -7,7 +7,11 @@ from pydantic import BaseModel, Field
 
 from app.models.listing import ListingValidationInput, N8nListingOutput
 from app.services.validator import evaluate_listing
-from app.services.sp_api_client import sp_api_client
+from app.services.sp_api_client import (
+    sp_api_client,
+    DEFAULT_POLICY,
+    AGGRESSIVE_POLICY,
+)
 from app.core.config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -42,6 +46,42 @@ def _build_error_fallback(asin: str, status_msg: str, error_detail: str) -> N8nL
             "A+ Comparativa": "N/A",
             "Reseñas Juntas": "N/A",
             "Notas": f"Fallo de transporte / SP-API: {error_detail[:120]}",
+            "Fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+    )
+
+
+# =============================================================================
+# HELPER — ESTADO DE NEGOCIO (para la capa resiliente de segunda pasada)
+# =============================================================================
+# Diferencia respecto a _build_error_fallback:
+#   - _build_error_fallback      → "hubo un fallo técnico" (flujo principal)
+#   - _build_business_state_fallback → "el producto no existe/no está autorizado"
+#     (segunda pasada, es un estado final, no un error)
+# =============================================================================
+def _build_business_state_fallback(
+    asin: str,
+    marketplace: str,
+    status: str,
+    detail: str,
+) -> N8nListingOutput:
+    """Construye un output válido cuando el ASIN no es procesable (estado de negocio)."""
+    logger.warning(
+        f"🚫 [BUSINESS STATE] ASIN={asin} ({marketplace}) | "
+        f"Status='{status}' | Detail='{detail[:100]}'"
+    )
+    return N8nListingOutput(
+        ASIN=asin,
+        **{
+            "Listing Status": status,
+            "Titulo": "N/A",
+            "Bullet Points": "N/A",
+            "Variaciones": "N/A",
+            "Imagenes Correctas": "N/A",
+            "Video": "N/A",
+            "A+ Comparativa": "N/A",
+            "Reseñas Juntas": "N/A",
+            "Notas": f"[{marketplace}] {detail[:160]}",
             "Fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
     )
@@ -140,6 +180,7 @@ async def batch_fetch_and_evaluate(payload: BatchEvalRequest):
     logger.info(f"🏁 [BATCH FINALIZADO] Se procesaron {len(results)} de {total_items} ASINs correctamente.")
     return list(results)
 
+
 @router.get("/warmup")
 async def warmup():
     """
@@ -159,3 +200,106 @@ async def warmup():
     except Exception as e:
         logger.warning(f"⚠️ [WARMUP] Fallo: {e}")
         return {"status": "partial", "error": str(e)}
+
+
+# =============================================================================
+# ENDPOINT RESILIENTE — Segunda pasada (retry agresivo + estados de negocio)
+# =============================================================================
+# Diseñado para re-procesar ASINs que quedaron como "Error" en el Sheet.
+# Se invoca desde n8n después de que el flujo principal termine.
+#
+# Diferencias vs /fetch-and-evaluate:
+#   1. Usa AGGRESSIVE_POLICY (5 intentos, backoff 5s → 10s → 20s → 40s ±30%)
+#   2. NO propaga 403/404 como error → los convierte en estados de negocio
+#   3. Nunca devuelve 500 al cliente (siempre N8nListingOutput válido)
+#   4. Solo 400/401 siguen siendo errores duros (config/auth roto)
+# =============================================================================
+@router.get("/fetch-and-evaluate-resilient/{marketplace}/{asin}", response_model=N8nListingOutput)
+async def fetch_and_evaluate_resilient(marketplace: str, asin: str):
+    print(f"\n>>> [RESILIENT] PETICIÓN -> ASIN: {asin}, Marketplace: {marketplace} <<<\n", flush=True)
+    """
+    Versión resiliente para segunda pasada.
+
+    - Retry agresivo (5 intentos con backoff exponencial + jitter).
+    - 403 → "Marketplace no autorizado" (estado de negocio)
+    - 404 → "Descontinuado / No Encontrado" (estado de negocio)
+    - Otros fallos → "Error tras reintentos"
+    - Nunca devuelve 5xx: siempre N8nListingOutput válido.
+    """
+    logger.info(
+        f"🛡️ [RESILIENT] Iniciando segunda pasada -> ASIN={asin} | Marketplace={marketplace}"
+    )
+
+    try:
+        input_data = await sp_api_client.fetch_catalog_item(
+            asin=asin,
+            marketplace=marketplace,
+            policy=AGGRESSIVE_POLICY,
+        )
+        print(f">>> [RESILIENT] DATA EXTRAÍDA: {input_data.model_dump()}\n", flush=True)
+
+        logger.info(f"📦 [RESILIENT SP-API OK] Datos obtenidos para {asin}:")
+        logger.info(f"  ├─ Título: {len(input_data.title or '')} chars")
+        logger.info(f"  ├─ Bullet Points: {len(input_data.bullet_points or [])} ítems")
+        logger.info(f"  ├─ Imágenes: {len(input_data.image_urls or [])} URLs")
+        logger.info(f"  └─ Variaciones: {len(input_data.variation_asins or [])} ASINs")
+
+        result = evaluate_listing(input_data)
+
+        if hasattr(result, "to_n8n_output"):
+            final_output = result.to_n8n_output(asin=asin)
+        else:
+            final_output = result
+
+        logger.info(
+            f"✅ [RESILIENT OK] ASIN={asin} ({marketplace}) | "
+            f"Status={final_output.listing_status if hasattr(final_output, 'listing_status') else 'OK'}"
+        )
+        return final_output
+
+    except HTTPException as e:
+        # 🔑 400/401 → error duro, no reintentable, se propaga
+        if e.status_code in (400, 401):
+            logger.error(
+                f"❌ [RESILIENT CONFIG] ASIN={asin} ({marketplace}) | "
+                f"HTTP {e.status_code}: {e.detail}"
+            )
+            raise e
+
+        # 🔑 403 → Marketplace no autorizado (el seller no vende ahí)
+        if e.status_code == 403:
+            return _build_business_state_fallback(
+                asin=asin,
+                marketplace=marketplace,
+                status="Marketplace no autorizado",
+                detail=f"El seller no tiene acceso a este marketplace. Detalle: {e.detail}",
+            )
+
+        # 🔑 404 → ASIN no existe en este marketplace (descontinuado o inválido)
+        if e.status_code == 404:
+            return _build_business_state_fallback(
+                asin=asin,
+                marketplace=marketplace,
+                status="Descontinuado / No Encontrado",
+                detail=f"ASIN no encontrado en Amazon ({marketplace}). Detalle: {e.detail}",
+            )
+
+        # 🔑 5xx u otros → error tras reintentos (ya se agotó AGGRESSIVE_POLICY)
+        return _build_business_state_fallback(
+            asin=asin,
+            marketplace=marketplace,
+            status="Error tras reintentos",
+            detail=f"HTTP {e.status_code}: {e.detail}",
+        )
+
+    except Exception as e:
+        logger.error(
+            f"💥 [RESILIENT UNHANDLED] ASIN={asin} ({marketplace}): {e}",
+            exc_info=True,
+        )
+        return _build_business_state_fallback(
+            asin=asin,
+            marketplace=marketplace,
+            status="Error tras reintentos",
+            detail=str(e),
+        )

@@ -4,6 +4,7 @@ import logging
 import random
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import HTTPException
@@ -31,6 +32,83 @@ USER_AGENTS = [
 
 # Pool de impersonaciones de curl_cffi (rotación de fingerprint TLS)
 IMPERSONATE_POOL = ["chrome120", "chrome124", "chrome131"]
+
+
+# =============================================================================
+# POLÍTICA DE REINTENTOS CON EXPONENTIAL BACKOFF + JITTER
+# =============================================================================
+# Objetivo: absorber 429 (Too Many Requests), 5xx y timeouts de Amazon sin
+# propagar el fallo al flujo. Se definen 2 presets para SP-API y 2 para el
+# scraper HTML (que históricamente usaba delays distintos):
+#   SP-API:
+#     - DEFAULT_POLICY         → 3 intentos, 1s, 2s (comportamiento histórico)
+#     - AGGRESSIVE_POLICY      → 5 intentos, 5s → 10s → 20s → 40s ±30%
+#   Scraper:
+#     - SCRAPE_DEFAULT_POLICY  → 3 intentos, 3s, 6s, 10s (comportamiento histórico)
+#     - SCRAPE_AGGRESSIVE_POLICY → 5 intentos, 5s → 10s → 20s → 40s ±30%
+# =============================================================================
+
+@dataclass
+class RetryPolicy:
+    max_attempts: int = 3
+    base_delay: float = 1.0        # delay del primer retry (segundos)
+    multiplier: float = 2.0         # factor exponencial
+    max_delay: float = 6.0          # tope duro por intento
+    jitter_ratio: float = 0.0       # ±ratio sobre el delay calculado (0 = sin jitter)
+
+
+def compute_backoff(attempt: int, policy: RetryPolicy) -> float:
+    """
+    Calcula el delay para el intento N con exponential backoff + jitter opcional.
+
+    Ejemplos:
+      SP-API DEFAULT_POLICY (attempt=1) → 1.0s
+      SP-API AGGRESSIVE_POLICY (attempt=3) → 20.0s ±30% → [14, 26]
+      SCRAPE_DEFAULT_POLICY (attempt=1) → 3.0s
+      SCRAPE_DEFAULT_POLICY (attempt=3) → 12.0s → cap 10.0s
+    """
+    raw = policy.base_delay * (policy.multiplier ** (attempt - 1))
+    raw = min(raw, policy.max_delay)
+    if policy.jitter_ratio > 0:
+        jitter = raw * policy.jitter_ratio * (2 * random.random() - 1)
+        raw = raw + jitter
+    return max(0.5, raw)
+
+
+# --- Políticas SP-API ---
+DEFAULT_POLICY = RetryPolicy(
+    max_attempts=3,
+    base_delay=1.0,
+    multiplier=2.0,
+    max_delay=6.0,
+    jitter_ratio=0.0,
+)
+
+AGGRESSIVE_POLICY = RetryPolicy(
+    max_attempts=5,
+    base_delay=5.0,
+    multiplier=2.0,
+    max_delay=60.0,
+    jitter_ratio=0.3,
+)
+
+# --- Políticas del scraper HTML ---
+# SCRAPE_DEFAULT replica la lógica histórica: 3s, 6s, 10s con jitter interno.
+SCRAPE_DEFAULT_POLICY = RetryPolicy(
+    max_attempts=3,
+    base_delay=3.0,
+    multiplier=2.0,
+    max_delay=10.0,
+    jitter_ratio=0.0,
+)
+
+SCRAPE_AGGRESSIVE_POLICY = RetryPolicy(
+    max_attempts=5,
+    base_delay=5.0,
+    multiplier=2.0,
+    max_delay=60.0,
+    jitter_ratio=0.3,
+)
 
 
 # =============================================================================
@@ -268,22 +346,97 @@ class SPAPIClient:
             logger.info(f"Nuevo token LWA generado exitosamente para región {region}.")
             return access_token
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=6),
-        retry=retry_if_exception_type((httpx.TransportError, httpx.TimeoutException, SPAPIRateLimitException, SPAPIServerException)),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
-        reraise=True
-    )
-    async def _execute_http_get(self, endpoint: str, headers: Dict[str, str], params: Dict[str, Any]) -> httpx.Response:
-        res = await self.client.get(endpoint, headers=headers, params=params)
-        if res.status_code == 429:
-            raise SPAPIRateLimitException("Rate limit 429 alcanzado en Amazon SP-API.")
-        if 500 <= res.status_code < 600:
-            raise SPAPIServerException(f"Error interno del servidor de Amazon SP-API: {res.status_code}.")
-        return res
+    # =========================================================================
+    # HTTP GET CON RETRY CONFIGURABLE (reemplaza el decorador tenacity)
+    # =========================================================================
+    async def _execute_http_get(
+        self,
+        endpoint: str,
+        headers: Dict[str, str],
+        params: Dict[str, Any],
+        policy: RetryPolicy = DEFAULT_POLICY,
+        context: str = "",
+    ) -> httpx.Response:
+        """
+        GET con retry manual + jitter para 429/5xx/timeouts.
 
-    async def _fetch_raw_catalog_item(self, asin: str, marketplace_id: str, region: str) -> Dict[str, Any]:
+        NO reintenta en 401, 403, 404 → esos son estados de negocio
+        y se devuelven como respuesta para que el caller decida.
+        """
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, policy.max_attempts + 1):
+            try:
+                res = await self.client.get(endpoint, headers=headers, params=params)
+            except (httpx.TransportError, httpx.TimeoutException) as e:
+                last_exc = e
+                if attempt >= policy.max_attempts:
+                    logger.error(
+                        f"❌ [RETRY EXHAUSTED NET] {context} | {type(e).__name__} | "
+                        f"intento {attempt}/{policy.max_attempts}"
+                    )
+                    raise
+                wait_s = compute_backoff(attempt, policy)
+                logger.warning(
+                    f"⏸️ [RETRY NET] {context} | {type(e).__name__} | "
+                    f"intento {attempt}/{policy.max_attempts} | esperando {wait_s:.1f}s"
+                )
+                await asyncio.sleep(wait_s)
+                continue
+
+            # 429 → retry con backoff
+            if res.status_code == 429:
+                last_exc = SPAPIRateLimitException(
+                    f"Rate limit 429 alcanzado en Amazon SP-API. Contexto: {context}"
+                )
+                if attempt >= policy.max_attempts:
+                    logger.error(
+                        f"❌ [RETRY EXHAUSTED 429] {context} | "
+                        f"intento {attempt}/{policy.max_attempts}"
+                    )
+                    raise last_exc
+                wait_s = compute_backoff(attempt, policy)
+                logger.warning(
+                    f"⏸️ [RETRY 429] {context} | "
+                    f"intento {attempt}/{policy.max_attempts} | esperando {wait_s:.1f}s"
+                )
+                await asyncio.sleep(wait_s)
+                continue
+
+            # 5xx → retry con backoff
+            if 500 <= res.status_code < 600:
+                last_exc = SPAPIServerException(
+                    f"Error interno del servidor de Amazon SP-API: {res.status_code}. Contexto: {context}"
+                )
+                if attempt >= policy.max_attempts:
+                    logger.error(
+                        f"❌ [RETRY EXHAUSTED 5xx] {context} | status {res.status_code} | "
+                        f"intento {attempt}/{policy.max_attempts}"
+                    )
+                    raise last_exc
+                wait_s = compute_backoff(attempt, policy)
+                logger.warning(
+                    f"⏸️ [RETRY 5xx] {context} | status {res.status_code} | "
+                    f"intento {attempt}/{policy.max_attempts} | esperando {wait_s:.1f}s"
+                )
+                await asyncio.sleep(wait_s)
+                continue
+
+            # Cualquier otro status (200, 400, 401, 403, 404) → devolver sin retry
+            return res
+
+        # Seguridad: nunca debería llegar aquí
+        if last_exc:
+            raise last_exc
+        raise SPAPIException(f"Retry loop agotado sin excepción registrada. Contexto: {context}")
+
+    async def _fetch_raw_catalog_item(
+        self,
+        asin: str,
+        marketplace_id: str,
+        region: str,
+        policy: RetryPolicy = DEFAULT_POLICY,
+    ) -> Dict[str, Any]:
         token = await self.get_lwa_access_token(region)
         base_url = settings.REGION_ENDPOINTS[region]
         endpoint = f"{base_url}/catalog/2022-04-01/items/{asin}"
@@ -293,13 +446,14 @@ class SPAPIClient:
             "includedData": "attributes,images,summaries,relationships"
         }
 
-        res = await self._execute_http_get(endpoint, headers, params)
+        context = f"SP-API Catalog asin={asin} market={marketplace_id}"
+        res = await self._execute_http_get(endpoint, headers, params, policy=policy, context=context)
 
         if res.status_code in (401, 403):
             self._token_cache.pop(region, None)
             new_token = await self.get_lwa_access_token(region)
             headers["x-amz-access-token"] = new_token
-            res = await self._execute_http_get(endpoint, headers, params)
+            res = await self._execute_http_get(endpoint, headers, params, policy=policy, context=context)
 
         if res.status_code != 200:
             raise HTTPException(
@@ -313,7 +467,11 @@ class SPAPIClient:
     # BUYABILITY — Product Pricing API (fuente oficial de estado)
     # =========================================================================
     async def _fetch_buyability_from_pricing_api(
-        self, asin: str, marketplace_id: str, region: str
+        self,
+        asin: str,
+        marketplace_id: str,
+        region: str,
+        policy: RetryPolicy = DEFAULT_POLICY,
     ) -> Optional[bool]:
         """
         Detecta si el listing es comprable usando Product Pricing API v0.
@@ -328,10 +486,13 @@ class SPAPIClient:
             base_url = settings.REGION_ENDPOINTS[region]
             headers = {"x-amz-access-token": token, "Content-Type": "application/json"}
 
+            context = f"SP-API Pricing asin={asin} market={marketplace_id}"
             res = await self._execute_http_get(
                 f"{base_url}/products/pricing/v0/items/{asin}/offers",
                 headers,
                 {"MarketplaceId": marketplace_id, "ItemCondition": "New"},
+                policy=policy,
+                context=context,
             )
 
             if res.status_code != 200:
@@ -362,6 +523,7 @@ class SPAPIClient:
         raw_data: Dict[str, Any],
         marketplace_id: str,
         region: str,
+        policy: RetryPolicy = DEFAULT_POLICY,
     ) -> Optional[bool]:
         """
         Resuelve el estado de buyability del ASIN consultado, manejando
@@ -387,15 +549,21 @@ class SPAPIClient:
                 f"Consultando buyability del hijo proxy: {proxy_asin}"
             )
             return await self._fetch_buyability_from_pricing_api(
-                proxy_asin, marketplace_id, region
+                proxy_asin, marketplace_id, region, policy=policy
             )
 
         # Es HIJO o STANDALONE → consultar directo
         return await self._fetch_buyability_from_pricing_api(
-            asin, marketplace_id, region
+            asin, marketplace_id, region, policy=policy
         )
 
-    async def _fetch_aplus_content(self, asin: str, marketplace_id: str, region: str) -> Dict[str, Any]:
+    async def _fetch_aplus_content(
+        self,
+        asin: str,
+        marketplace_id: str,
+        region: str,
+        policy: RetryPolicy = DEFAULT_POLICY,
+    ) -> Dict[str, Any]:
         """Consulta la A+ Content API para validar presencia de módulos, tablas comparativas y video."""
         result = {
             "has_a_plus": False,
@@ -413,7 +581,10 @@ class SPAPIClient:
             endpoint_docs = f"{base_url}/aplus/2020-11-01/asins/{asin}/documents"
             params_docs = {"marketplaceId": marketplace_id}
 
-            res_docs = await self._execute_http_get(endpoint_docs, headers, params_docs)
+            context_docs = f"SP-API A+ docs asin={asin} market={marketplace_id}"
+            res_docs = await self._execute_http_get(
+                endpoint_docs, headers, params_docs, policy=policy, context=context_docs
+            )
 
             if res_docs.status_code == 200:
                 docs_data = res_docs.json()
@@ -429,7 +600,10 @@ class SPAPIClient:
                             "marketplaceId": marketplace_id,
                             "includedDataSet": "CONTENTS"
                         }
-                        res_detail = await self._execute_http_get(endpoint_detail, headers, params_detail)
+                        context_detail = f"SP-API A+ detail doc={doc_id}"
+                        res_detail = await self._execute_http_get(
+                            endpoint_detail, headers, params_detail, policy=policy, context=context_detail
+                        )
 
                         if res_detail.status_code == 200:
                             detail_data = res_detail.json()
@@ -863,35 +1037,52 @@ class SPAPIClient:
         self,
         asin: str,
         marketplace: str,
-        max_attempts: int = 4
+        max_attempts: int = 3,
+        policy: RetryPolicy = SCRAPE_DEFAULT_POLICY,
     ) -> Optional[str]:
         """
-        Intenta scrapear el ASIN con reintentos agresivos y delays crecientes.
-        Delays: 0s, 3s, 6s, 10s con jitter.
+        Intenta scrapear el ASIN con reintentos y delays crecientes según la policy.
+
+        Con SCRAPE_DEFAULT_POLICY (histórico): 3s → 6s → 10s
+        Con SCRAPE_AGGRESSIVE_POLICY: 5s → 10s → 20s → 40s ±30%
+
+        El parámetro `max_attempts` permite override puntual; si es menor que
+        policy.max_attempts, se usa el máximo entre ambos.
         """
-        for attempt in range(1, max_attempts + 1):
+        effective_attempts = max(max_attempts, policy.max_attempts)
+
+        for attempt in range(1, effective_attempts + 1):
             if attempt == 1:
                 delay = 0.0
             else:
-                # Delays progresivos: 3s, 6s, 10s
-                delay = min(3.0 * (2 ** (attempt - 2)), 10.0)
+                # compute_backoff(attempt - 1, policy): para attempt=2 → 1ra iteración del backoff
+                delay = compute_backoff(attempt - 1, policy)
 
             html = await self._fetch_public_html(asin, marketplace, retry_delay=delay)
             if html:
                 if attempt > 1:
-                    logger.info(f"✅ [RETRY OK] {asin} recuperado en intento {attempt}/{max_attempts}")
+                    logger.info(
+                        f"✅ [SCRAPE RETRY OK] {asin} recuperado en intento "
+                        f"{attempt}/{effective_attempts}"
+                    )
                 return html
 
-            if attempt < max_attempts:
+            if attempt < effective_attempts:
+                next_delay = compute_backoff(attempt, policy)
                 logger.info(
-                    f"↻ Reintentando scrape de {asin} "
-                    f"(intento {attempt + 1}/{max_attempts} en {delay * 2:.0f}s)"
+                    f"↻ [SCRAPE RETRY] {asin} ({marketplace}) | "
+                    f"intento {attempt + 1}/{effective_attempts} en {next_delay:.0f}s"
                 )
 
-        logger.warning(f"❌ Scrape de {asin} falló tras {max_attempts} intentos")
+        logger.warning(f"❌ Scrape de {asin} falló tras {effective_attempts} intentos")
         return None
 
-    async def _fallback_public_page_check(self, asin: str, marketplace: str) -> Dict[str, Any]:
+    async def _fallback_public_page_check(
+        self,
+        asin: str,
+        marketplace: str,
+        policy: RetryPolicy = SCRAPE_DEFAULT_POLICY,
+    ) -> Dict[str, Any]:
         """
         Extrae Video, A+, Reseñas y A+ Comparativa desde la vista pública de Amazon.
         Incluye banderas `scrape_success` y `html_complete` para que el motor
@@ -906,10 +1097,12 @@ class SPAPIClient:
             "review_count": None,
             "scrape_success": False,
             "image_count_from_html": None,
-            "html_complete": False,  # 🔑 NUEVO: indica si el HTML es completo (>= 1.2M chars)
+            "html_complete": False,
         }
 
-        html = await self._fetch_public_html_with_retry(asin, marketplace, max_attempts=3)
+        html = await self._fetch_public_html_with_retry(
+            asin, marketplace, max_attempts=policy.max_attempts, policy=policy
+        )
         if not html:
             return result
 
@@ -990,7 +1183,8 @@ class SPAPIClient:
         raw_data: Dict[str, Any],
         parent_asin: Optional[str],
         marketplace_id: str,
-        region: str
+        region: str,
+        policy: RetryPolicy = DEFAULT_POLICY,
     ) -> List[str]:
         """
         Construye la lista de variantes REALES (child ASINs) de la familia.
@@ -1019,7 +1213,9 @@ class SPAPIClient:
         # Caso 2: El ASIN actual es HIJO → sus hermanos son las variantes
         if parent_asin:
             try:
-                parent_data = await self._fetch_raw_catalog_item(parent_asin, marketplace_id, region)
+                parent_data = await self._fetch_raw_catalog_item(
+                    parent_asin, marketplace_id, region, policy=policy
+                )
                 siblings = self._extract_child_asins(parent_data)
                 if siblings:
                     unique_siblings = sorted(set(siblings))
@@ -1047,7 +1243,12 @@ class SPAPIClient:
     # =========================================================================
     # FLUJO PRINCIPAL
     # =========================================================================
-    async def fetch_catalog_item(self, asin: str, marketplace: str) -> ListingValidationInput:
+    async def fetch_catalog_item(
+        self,
+        asin: str,
+        marketplace: str,
+        policy: RetryPolicy = DEFAULT_POLICY,
+    ) -> ListingValidationInput:
         mkt_code = self._normalize(marketplace)
         marketplace_id = settings.MARKETPLACE_IDS.get(mkt_code)
         if not marketplace_id:
@@ -1055,12 +1256,22 @@ class SPAPIClient:
 
         region = self._get_region(mkt_code)
 
+        # 🔑 Traducir la política SP-API a la política del scraper.
+        # DEFAULT_POLICY (SP-API) → SCRAPE_DEFAULT_POLICY (scraper)
+        # AGGRESSIVE_POLICY (SP-API) → SCRAPE_AGGRESSIVE_POLICY (scraper)
+        scraper_policy = (
+            SCRAPE_AGGRESSIVE_POLICY if policy is AGGRESSIVE_POLICY
+            else SCRAPE_DEFAULT_POLICY
+        )
+
         if getattr(settings, "ENABLE_MOCK", False):
             logger.info(f"ENABLE_MOCK activo. Generando datos simulados para ASIN {asin} en {mkt_code}.")
             return self._get_mock_fallback_data(asin, mkt_code)
 
         try:
-            raw_data = await self._fetch_raw_catalog_item(asin, marketplace_id, region)
+            raw_data = await self._fetch_raw_catalog_item(
+                asin, marketplace_id, region, policy=policy
+            )
 
             parent_asin = self._extract_parent_asin(raw_data)
             if parent_asin:
@@ -1069,13 +1280,12 @@ class SPAPIClient:
                 logger.info(f"ASIN {asin} no tiene Parent ASIN (standalone o padre directo).")
 
             # 🔑 Consultar buyability con manejo correcto de Parent ASIN
-            # Si el ASIN es PADRE → consultar al primer hijo como proxy
-            # Si es HIJO o STANDALONE → consultar directamente
             pricing_buyable = await self._resolve_buyability(
                 asin=asin,
                 raw_data=raw_data,
                 marketplace_id=marketplace_id,
                 region=region,
+                policy=policy,
             )
 
             variation_family = await self._resolve_variation_family(
@@ -1083,23 +1293,32 @@ class SPAPIClient:
                 raw_data=raw_data,
                 parent_asin=parent_asin,
                 marketplace_id=marketplace_id,
-                region=region
+                region=region,
+                policy=policy,
             )
 
-            aplus_data = await self._fetch_aplus_content(asin, marketplace_id, region)
+            aplus_data = await self._fetch_aplus_content(
+                asin, marketplace_id, region, policy=policy
+            )
 
             if not aplus_data["has_a_plus"] and parent_asin:
                 logger.info(f"ASIN {asin} sin A+ directo. Reintentando A+ con Parent ASIN: {parent_asin}")
-                aplus_data = await self._fetch_aplus_content(parent_asin, marketplace_id, region)
+                aplus_data = await self._fetch_aplus_content(
+                    parent_asin, marketplace_id, region, policy=policy
+                )
 
-            fallback_data = await self._fallback_public_page_check(asin, mkt_code)
+            # 🔑 Scraper con la política traducida
+            fallback_data = await self._fallback_public_page_check(
+                asin, mkt_code, policy=scraper_policy
+            )
 
-            # 🔑 NUEVO: propagar html_complete
             html_complete = fallback_data.get("html_complete", False)
 
             if not fallback_data["has_a_plus"] and parent_asin and parent_asin != asin:
                 logger.info(f"ASIN {asin} sin A+ en HTML. Scrapeando padre {parent_asin} con retry...")
-                parent_html = await self._fetch_public_html_with_retry(parent_asin, mkt_code, max_attempts=3)
+                parent_html = await self._fetch_public_html_with_retry(
+                    parent_asin, mkt_code, max_attempts=3, policy=scraper_policy
+                )
                 if parent_html:
                     parent_aplus = self._parse_aplus_from_html(parent_html, parent_asin)
                     if parent_aplus.get("has_a_plus"):
@@ -1132,7 +1351,9 @@ class SPAPIClient:
             review_count_parent = None
             if parent_asin and parent_asin != asin and review_count_child is not None:
                 try:
-                    parent_html_for_reviews = await self._fetch_public_html_with_retry(parent_asin, mkt_code, max_attempts=2)
+                    parent_html_for_reviews = await self._fetch_public_html_with_retry(
+                        parent_asin, mkt_code, max_attempts=2, policy=scraper_policy
+                    )
                     if parent_html_for_reviews:
                         review_count_parent = self._parse_review_count_from_html(parent_html_for_reviews)
                         logger.info(
@@ -1156,7 +1377,7 @@ class SPAPIClient:
                 scrape_success=scrape_success,
                 is_buyable=pricing_buyable,
                 image_count_from_html=image_count_from_html,
-                html_complete=html_complete,  # 🔑 NUEVO
+                html_complete=html_complete,
             )
 
         except (SPAPIRateLimitException, SPAPIServerException) as e:
@@ -1181,7 +1402,7 @@ class SPAPIClient:
         scrape_success: bool = False,
         is_buyable: Optional[bool] = None,
         image_count_from_html: Optional[int] = None,
-        html_complete: bool = False,  # 🔑 NUEVO
+        html_complete: bool = False,
     ) -> ListingValidationInput:
         attributes = data.get("attributes", {})
         summaries_list = data.get("summaries", [])
@@ -1294,12 +1515,6 @@ class SPAPIClient:
 
         # =====================================================================
         # 🔑 DETERMINACIÓN DE has_a_plus (con soporte para HTML recortado)
-        # =====================================================================
-        # Ramas:
-        #   1. A+ detectado (SP-API o HTML completo) → True
-        #   2. Scraper no llegó → None (N/A — no verificable)
-        #   3. Scraper llegó pero HTML recortado → None (N/A — no podemos confirmar ausencia)
-        #   4. Scraper llegó, HTML completo, sin A+ → False (NOK — confirmado sin A+)
         # =====================================================================
         has_a_plus_sp = aplus_data.get("has_a_plus", False)
         a_plus_count = aplus_data.get("a_plus_comparison_products_count", 0)
