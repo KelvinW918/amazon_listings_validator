@@ -32,8 +32,8 @@ BULLET_FORMAT_REGEX = re.compile(
     r'ÁÉÍÓÚÑÜ'                    # Español
     r'ÀÈÌÒÙÂÊÎÔÛÄËÏÖÜÇŒÆ'         # Italiano / Francés / Alemán
     r'\-–—'
-    r'_()/.&\'`´,'                # 🔑 AÑADIDA LA COMA
-    r':;!?'                       # 🔑 AÑADIDOS SIGNOS COMUNES
+    r'_()/.&\'`´,'                # Coma incluida
+    r':;!?'                       # Signos comunes incluidos
     r']+?'
     r'):'
     r'\s',
@@ -138,7 +138,7 @@ def validate_listing_status(status_input: bool | str | None) -> Tuple[str, str]:
 # REGLA 2 — TÍTULO
 # =========================================================================
 def validate_title(title: str | None, max_override: int | None = None) -> Tuple[str, str]:
-    """Regla 2: Título en rango 70-200 chars (o override) con normalización Unicode."""
+    """Regla 2: Título en rango 50-200 chars (o override) con normalización Unicode."""
     clean = unicodedata.normalize("NFC", title or "").strip()
     min_len = settings.DEFAULT_MIN_TITLE_LEN
     max_len = max_override if max_override is not None else settings.DEFAULT_MAX_TITLE_LEN
@@ -274,11 +274,9 @@ def validate_reviews_sync(
        a. Si tenemos datos numéricos de reseñas por variante:
           - Si todos los conteos son iguales -> OK (reseñas unificadas).
           - Si hay discrepancia -> NOK (reseñas fragmentadas).
-       b. Si NO tenemos datos numéricos (SP-API no expone el conteo por variante):
-          - Asumir OK por estar en una familia con variaciones.
-            Amazon unifica las reseñas a nivel de familia cuando el seller
-            ha configurado correctamente el Parent/Child. La ausencia de
-            métricas individuales no debe penalizar al listing.
+       b. Si NO tenemos datos numéricos suficientes:
+          - Devuelve N/A para no dar un falso OK. Es mejor reportar falta de datos
+            que asumir que está bien cuando el scraper del padre pudo haber fallado.
     """
 
     # 1. Si no tiene variaciones, la regla de "reseñas juntas" no aplica
@@ -295,13 +293,13 @@ def validate_reviews_sync(
 
         return "NOK", f"Reseñas no consolidadas entre variantes: {review_counts}"
 
-    # 3. Si tiene variaciones pero NO tenemos la métrica individual de reviews por SP-API,
-    #    asumir OK por estar en una familia con variaciones unificadas.
-    #    La ausencia de datos no debe penalizar al listing.
+    # 3. Si tiene variaciones pero NO tenemos la métrica individual de reviews
+    #    (porque el scraper del padre falló y no se replicaron los datos),
+    #    es más honesto devolver N/A que un falso OK.
     return (
-        "OK",
+        "N/A",
         f"Familia con {len(variation_asins)} variantes. "
-        f"Reseñas unificadas por defecto (sin desglose por SP-API).",
+        f"Sin datos suficientes de reseñas para verificar unificación.",
     )
 
 

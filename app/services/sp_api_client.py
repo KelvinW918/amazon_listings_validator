@@ -1502,16 +1502,20 @@ class SPAPIClient:
         else:
             has_video = None
 
+        # =====================================================================
+        # 🔑 FIX RESEÑAS JUNTAS:
+        # Solo construimos `variant_review_counts` si tenemos AMBOS conteos
+        # (Hijo y Padre). Si falló el scrape del padre, dejamos None para que
+        # el validador devuelva N/A y no un falso OK.
+        # =====================================================================
         variant_review_counts: Optional[List[int]] = None
+
         if review_count_child is not None and review_count_parent is not None:
             if review_count_child == review_count_parent:
                 variant_review_counts = [review_count_child] * len(variation_asins)
             else:
                 variant_review_counts = [review_count_child, review_count_parent]
-        elif review_count_child is not None:
-            variant_review_counts = [review_count_child] * len(variation_asins)
-        elif review_count_parent is not None:
-            variant_review_counts = [review_count_parent] * len(variation_asins)
+        # NOTA: Eliminamos los bloques `elif` que replicaban el conteo y causaban falsos positivos.
 
         # =====================================================================
         # 🔑 DETERMINACIÓN DE has_a_plus (con soporte para HTML recortado)

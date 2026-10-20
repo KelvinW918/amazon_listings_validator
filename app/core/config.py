@@ -56,9 +56,6 @@ class Settings(BaseSettings):
             "US": "ATVPDKIKX0DER",
             "CA": "A2EUQ1WTGCTBG2",
             "MX": "A1AM78C64UM0Y8",
-            # Lejano Oriente
-            "JP": "A1VC38T7YXB528",
-            "AU": "A39IBJ37TRP1C6",
         }
     )
 
@@ -124,7 +121,7 @@ class Settings(BaseSettings):
     )
 
     # Parámetros por defecto SOP Domy / Reglas de Validación
-    DEFAULT_MIN_TITLE_LEN: int = 70
+    DEFAULT_MIN_TITLE_LEN: int = 50
     DEFAULT_MAX_TITLE_LEN: int = 200
     OVERRIDE_MAX_TITLE_LEN: int = 201
     REQUIRED_BULLETS_COUNT: int = 5
